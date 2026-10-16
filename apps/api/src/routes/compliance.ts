@@ -8,6 +8,13 @@ import {
   tosReacceptanceGate,
   type AuthedRequest,
 } from '../auth.js';
+import { getReportTemplate } from './report-templates.js';
+import { REPORT_URL_EXPIRES_IN_SECONDS, presignReportUrl } from '../jobs/compliance-report.js';
+import {
+  REPORT_CADENCES,
+  SCHEDULED_REPORT_TYPES,
+  computeNextRunAt,
+} from '../jobs/scheduled-compliance-reports.js';
 
 export const complianceRouter = Router();
 complianceRouter.use(authMiddleware);
@@ -181,6 +188,9 @@ complianceRouter.get('/flags', async (req: Request, res: Response) => {
       resolution_status: z.enum(['open', 'resolved']).optional(),
       severity: z.enum(['low', 'medium', 'high', 'critical']).optional(),
       importer_id: z.string().uuid().optional(),
+      assigned_to: z.string().uuid().optional(),
+      case_status: z.enum(['new', 'investigating', 'escalated', 'resolved']).optional(),
+      priority: z.enum(['low', 'medium', 'high', 'critical']).optional(),
       limit: z.coerce.number().int().positive().max(100).default(50),
       offset: z.coerce.number().int().min(0).default(0),
     })
@@ -191,7 +201,16 @@ complianceRouter.get('/flags', async (req: Request, res: Response) => {
     return;
   }
 
-  const { resolution_status, severity, importer_id, limit, offset } = query.data;
+  const {
+    resolution_status,
+    severity,
+    importer_id,
+    assigned_to,
+    case_status,
+    priority,
+    limit,
+    offset,
+  } = query.data;
   const conditions: string[] = ['cf.surety_id = $1'];
   const params: unknown[] = [user.id];
   let idx = 2;
@@ -208,6 +227,18 @@ complianceRouter.get('/flags', async (req: Request, res: Response) => {
     conditions.push(`cf.importer_id = $${idx++}`);
     params.push(importer_id);
   }
+  if (assigned_to) {
+    conditions.push(`cf.assigned_to = $${idx++}`);
+    params.push(assigned_to);
+  }
+  if (case_status) {
+    conditions.push(`cf.case_status = $${idx++}`);
+    params.push(case_status);
+  }
+  if (priority) {
+    conditions.push(`cf.priority = $${idx++}`);
+    params.push(priority);
+  }
 
   const where = conditions.join(' AND ');
 
@@ -215,11 +246,15 @@ complianceRouter.get('/flags', async (req: Request, res: Response) => {
     pool.query(
       `SELECT cf.id, cf.importer_id, i.legal_name AS importer_name,
               cf.flag_type, cf.severity, cf.description,
-              cf.resolution_status, cf.resolution_note, cf.resolved_at, cf.created_at
+              cf.resolution_status, cf.resolution_note, cf.resolved_at, cf.created_at,
+              cf.assigned_to, cf.priority, cf.case_status,
+              EXTRACT(EPOCH FROM (now() - cf.created_at)) / 3600 AS age_hours
        FROM compliance_flags cf
        JOIN importers i ON i.id = cf.importer_id
        WHERE ${where}
-       ORDER BY cf.created_at DESC
+       ORDER BY 
+         CASE cf.priority WHEN 'critical' THEN 0 WHEN 'high' THEN 1 WHEN 'medium' THEN 2 ELSE 3 END,
+         cf.created_at DESC
        LIMIT $${idx} OFFSET $${idx + 1}`,
       [...params, limit, offset]
     ),
@@ -229,8 +264,15 @@ complianceRouter.get('/flags', async (req: Request, res: Response) => {
     ),
   ]);
 
+  // SLA indicator: flag cases open beyond 72 hours (3 days)
+  const slaThresholdHours = 72;
+  const flagsWithSla = flags.rows.map((flag) => ({
+    ...flag,
+    slaBreached: Number(flag.age_hours) > slaThresholdHours,
+  }));
+
   res.json({
-    flags: flags.rows,
+    flags: flagsWithSla,
     total: parseInt(total.rows[0]?.cnt ?? '0', 10),
     limit,
     offset,
@@ -270,15 +312,137 @@ complianceRouter.post('/flags/:id/resolve', async (req: Request, res: Response) 
   res.json({ success: true });
 });
 
+// POST /api/v1/compliance/flags/:id/assign — assign a flag to an admin user
+complianceRouter.post('/flags/:id/assign', async (req: Request, res: Response) => {
+  const user = (req as AuthedRequest).user;
+
+  const parse = z.object({ assigned_to: z.string().uuid() }).safeParse(req.body);
+  if (!parse.success) {
+    res.status(400).json({ error: 'assigned_to is required' });
+    return;
+  }
+
+  const flag = await pool.query(
+    `SELECT id FROM compliance_flags WHERE id = $1 AND surety_id = $2`,
+    [req.params.id, user.id]
+  );
+  if (!flag.rowCount) {
+    res.status(404).json({ error: 'flag not found' });
+    return;
+  }
+
+  await pool.query(
+    `UPDATE compliance_flags
+     SET assigned_to = $1, case_status = 'investigating', updated_at = now()
+     WHERE id = $2`,
+    [parse.data.assigned_to, req.params.id]
+  );
+
+  res.json({ success: true });
+});
+
+// POST /api/v1/compliance/flags/:id/status — update case status
+complianceRouter.post('/flags/:id/status', async (req: Request, res: Response) => {
+  const user = (req as AuthedRequest).user;
+
+  const parse = z
+    .object({
+      case_status: z.enum(['new', 'investigating', 'escalated', 'resolved']),
+      priority: z.enum(['low', 'medium', 'high', 'critical']).optional(),
+    })
+    .safeParse(req.body);
+  if (!parse.success) {
+    res.status(400).json({ error: 'invalid input' });
+    return;
+  }
+
+  const flag = await pool.query(
+    `SELECT id FROM compliance_flags WHERE id = $1 AND surety_id = $2`,
+    [req.params.id, user.id]
+  );
+  if (!flag.rowCount) {
+    res.status(404).json({ error: 'flag not found' });
+    return;
+  }
+
+  const updates = ['case_status = $1', 'updated_at = now()'];
+  const params: unknown[] = [parse.data.case_status];
+  let idx = 2;
+
+  if (parse.data.priority) {
+    updates.push(`priority = $${idx++}`);
+    params.push(parse.data.priority);
+  }
+
+  params.push(req.params.id);
+  await pool.query(`UPDATE compliance_flags SET ${updates.join(', ')} WHERE id = $${idx}`, params);
+
+  res.json({ success: true });
+});
+
+// POST /api/v1/compliance/flags/:id/notes — add a case note
+complianceRouter.post('/flags/:id/notes', async (req: Request, res: Response) => {
+  const user = (req as AuthedRequest).user;
+
+  const parse = z.object({ content: z.string().min(1) }).safeParse(req.body);
+  if (!parse.success) {
+    res.status(400).json({ error: 'content is required' });
+    return;
+  }
+
+  const flag = await pool.query(
+    `SELECT id FROM compliance_flags WHERE id = $1 AND surety_id = $2`,
+    [req.params.id, user.id]
+  );
+  if (!flag.rowCount) {
+    res.status(404).json({ error: 'flag not found' });
+    return;
+  }
+
+  const result = await pool.query(
+    `INSERT INTO compliance_case_notes (flag_id, author_id, content)
+     VALUES ($1, $2, $3)
+     RETURNING id, flag_id, author_id, content, created_at`,
+    [req.params.id, user.id, parse.data.content]
+  );
+
+  res.status(201).json({ note: result.rows[0] });
+});
+
+// GET /api/v1/compliance/flags/:id/notes — list case notes
+complianceRouter.get('/flags/:id/notes', async (req: Request, res: Response) => {
+  const user = (req as AuthedRequest).user;
+
+  const flag = await pool.query(
+    `SELECT id FROM compliance_flags WHERE id = $1 AND surety_id = $2`,
+    [req.params.id, user.id]
+  );
+  if (!flag.rowCount) {
+    res.status(404).json({ error: 'flag not found' });
+    return;
+  }
+
+  const result = await pool.query(
+    `SELECT id, flag_id, author_id, content, created_at
+     FROM compliance_case_notes
+     WHERE flag_id = $1
+     ORDER BY created_at DESC`,
+    [req.params.id]
+  );
+
+  res.json({ notes: result.rows });
+});
+
 // GET /api/v1/compliance/reports — list available compliance reports for this surety
 complianceRouter.get('/reports', async (req: Request, res: Response) => {
   const user = (req as AuthedRequest).user;
 
   const reports = await pool.query(
-    `SELECT id, report_month, generated_at, pdf_s3_key IS NOT NULL AS has_pdf, superseded_at
+    `SELECT id, report_month, period_end, schedule_id, generated_at,
+            pdf_s3_key IS NOT NULL AS has_pdf, superseded_at
      FROM compliance_reports
      WHERE surety_id = $1
-     ORDER BY report_month DESC`,
+     ORDER BY report_month DESC, generated_at DESC`,
     [user.id]
   );
   res.json({ reports: reports.rows });
@@ -299,7 +463,510 @@ complianceRouter.get('/reports/:id/download', async (req: Request, res: Response
   }
 
   const key: string = reportRow.pdf_s3_key;
-  // In production, generate a pre-signed S3 GetObject URL here.
-  const url = `/dev/reports/${key}`;
-  res.json({ url, expiresInSeconds: 900 });
+  const url = presignReportUrl(key);
+  // #1032: the tenant's branded export template — the PDF renderer applies
+  // logo/header/footer from this when generating the file at `key`; it does
+  // not change the underlying report data the PDF is built from.
+  const reportTemplate = await getReportTemplate(user.id);
+  res.json({ url, expiresInSeconds: REPORT_URL_EXPIRES_IN_SECONDS, reportTemplate });
 });
+
+// ── #1013: scheduled automated report delivery ──────────────────────────────
+
+const SCHEDULE_COLUMNS = `id, surety_id, report_type, cadence, recipients, is_paused,
+  next_run_at, last_run_at, last_error, created_at, updated_at`;
+
+const recipientsSchema = z.array(z.string().email()).min(1).max(20);
+
+// GET /api/v1/compliance/report-schedules
+complianceRouter.get('/report-schedules', async (req: Request, res: Response) => {
+  const user = (req as AuthedRequest).user;
+
+  const schedules = await pool.query(
+    `SELECT ${SCHEDULE_COLUMNS} FROM compliance_report_schedules
+     WHERE surety_id = $1
+     ORDER BY created_at DESC`,
+    [user.id]
+  );
+  res.json({ schedules: schedules.rows });
+});
+
+// POST /api/v1/compliance/report-schedules
+complianceRouter.post('/report-schedules', async (req: Request, res: Response) => {
+  const user = (req as AuthedRequest).user;
+
+  const parse = z
+    .object({
+      report_type: z.enum(SCHEDULED_REPORT_TYPES),
+      cadence: z.enum(REPORT_CADENCES),
+      recipients: recipientsSchema,
+    })
+    .safeParse(req.body);
+  if (!parse.success) {
+    res.status(400).json({ error: 'invalid input', details: parse.error });
+    return;
+  }
+
+  const { report_type, cadence, recipients } = parse.data;
+  const result = await pool.query(
+    `INSERT INTO compliance_report_schedules
+       (surety_id, report_type, cadence, recipients, next_run_at)
+     VALUES ($1, $2, $3, $4, $5)
+     RETURNING ${SCHEDULE_COLUMNS}`,
+    [user.id, report_type, cadence, [...new Set(recipients)], computeNextRunAt(cadence, new Date())]
+  );
+
+  res.status(201).json({ schedule: result.rows[0] });
+});
+
+// PUT /api/v1/compliance/report-schedules/:id — edit, pause (is_paused: true) or resume
+complianceRouter.put('/report-schedules/:id', async (req: Request, res: Response) => {
+  const user = (req as AuthedRequest).user;
+
+  const parse = z
+    .object({
+      report_type: z.enum(SCHEDULED_REPORT_TYPES).optional(),
+      cadence: z.enum(REPORT_CADENCES).optional(),
+      recipients: recipientsSchema.optional(),
+      is_paused: z.boolean().optional(),
+    })
+    .safeParse(req.body);
+  if (!parse.success) {
+    res.status(400).json({ error: 'invalid input', details: parse.error });
+    return;
+  }
+
+  const existing = await pool.query<{
+    cadence: (typeof REPORT_CADENCES)[number];
+    is_paused: boolean;
+    next_run_at: Date;
+  }>(
+    `SELECT cadence, is_paused, next_run_at FROM compliance_report_schedules
+     WHERE id = $1 AND surety_id = $2`,
+    [req.params.id, user.id]
+  );
+  const current = existing.rows[0];
+  if (!current) {
+    res.status(404).json({ error: 'report schedule not found' });
+    return;
+  }
+
+  const updates: string[] = ['updated_at = now()'];
+  const params: unknown[] = [];
+  let idx = 1;
+
+  if (parse.data.report_type !== undefined) {
+    updates.push(`report_type = $${idx++}`);
+    params.push(parse.data.report_type);
+  }
+  if (parse.data.cadence !== undefined) {
+    updates.push(`cadence = $${idx++}`);
+    params.push(parse.data.cadence);
+  }
+  if (parse.data.recipients !== undefined) {
+    updates.push(`recipients = $${idx++}`);
+    params.push([...new Set(parse.data.recipients)]);
+  }
+  if (parse.data.is_paused !== undefined) {
+    updates.push(`is_paused = $${idx++}`);
+    params.push(parse.data.is_paused);
+  }
+
+  // Re-anchor the next run when the cadence changes, or when resuming a
+  // schedule whose slot passed while paused (so it doesn't fire immediately).
+  const cadence = parse.data.cadence ?? current.cadence;
+  const resuming = current.is_paused && parse.data.is_paused === false;
+  const slotPassed = new Date(current.next_run_at) <= new Date();
+  if (
+    (parse.data.cadence !== undefined && parse.data.cadence !== current.cadence) ||
+    (resuming && slotPassed)
+  ) {
+    updates.push(`next_run_at = $${idx++}`);
+    params.push(computeNextRunAt(cadence, new Date()));
+  }
+
+  params.push(req.params.id);
+  const result = await pool.query(
+    `UPDATE compliance_report_schedules
+     SET ${updates.join(', ')}
+     WHERE id = $${idx}
+     RETURNING ${SCHEDULE_COLUMNS}`,
+    params
+  );
+
+  res.json({ schedule: result.rows[0] });
+});
+
+// DELETE /api/v1/compliance/report-schedules/:id — generated reports are kept
+complianceRouter.delete('/report-schedules/:id', async (req: Request, res: Response) => {
+  const user = (req as AuthedRequest).user;
+
+  const result = await pool.query(
+    `DELETE FROM compliance_report_schedules
+     WHERE id = $1 AND surety_id = $2
+     RETURNING id`,
+    [req.params.id, user.id]
+  );
+  if (!result.rowCount) {
+    res.status(404).json({ error: 'report schedule not found' });
+    return;
+  }
+
+  res.json({ success: true });
+});
+
+// GET /api/v1/compliance/report-schedules/:id/deliveries — delivery log incl. failures
+complianceRouter.get('/report-schedules/:id/deliveries', async (req: Request, res: Response) => {
+  const user = (req as AuthedRequest).user;
+
+  const query = z
+    .object({
+      status: z.enum(['pending', 'sent', 'failed']).optional(),
+      limit: z.coerce.number().int().positive().max(100).default(50),
+      offset: z.coerce.number().int().min(0).default(0),
+    })
+    .safeParse(req.query);
+  if (!query.success) {
+    res.status(400).json({ error: 'invalid query parameters' });
+    return;
+  }
+
+  const schedule = await pool.query(
+    `SELECT id FROM compliance_report_schedules WHERE id = $1 AND surety_id = $2`,
+    [req.params.id, user.id]
+  );
+  if (!schedule.rowCount) {
+    res.status(404).json({ error: 'report schedule not found' });
+    return;
+  }
+
+  const { status, limit, offset } = query.data;
+  const deliveries = await pool.query(
+    `SELECT d.id, d.report_id, r.report_month, r.period_end, d.recipient, d.status,
+            d.attempts, d.last_error, d.next_attempt_at, d.sent_at, d.token_expires_at,
+            d.last_accessed_at, d.created_at
+     FROM compliance_report_deliveries d
+     JOIN compliance_reports r ON r.id = d.report_id
+     WHERE d.schedule_id = $1 AND ($2::text IS NULL OR d.status = $2)
+     ORDER BY d.created_at DESC
+     LIMIT $3 OFFSET $4`,
+    [req.params.id, status ?? null, limit, offset]
+  );
+
+  res.json({ deliveries: deliveries.rows, limit, offset });
+});
+
+// GET /api/v1/compliance/escalation-rules — list escalation rules
+complianceRouter.get('/escalation-rules', async (req: Request, res: Response) => {
+  const user = (req as AuthedRequest).user;
+
+  const rules = await pool.query(
+    `SELECT id, surety_id, age_threshold_hours, escalation_target_role,
+            escalation_target_user_id, is_active, created_at, updated_at
+     FROM compliance_escalation_rules
+     WHERE surety_id = $1
+     ORDER BY age_threshold_hours ASC`,
+    [user.id]
+  );
+
+  res.json({ rules: rules.rows });
+});
+
+// POST /api/v1/compliance/escalation-rules — create escalation rule
+complianceRouter.post('/escalation-rules', async (req: Request, res: Response) => {
+  const user = (req as AuthedRequest).user;
+
+  const parse = z
+    .object({
+      age_threshold_hours: z.number().int().positive().max(720), // max 30 days
+      escalation_target_role: z.enum(['senior_admin', 'specific_user']),
+      escalation_target_user_id: z.string().uuid().optional(),
+    })
+    .safeParse(req.body);
+
+  if (!parse.success) {
+    res.status(400).json({ error: 'invalid input', details: parse.error });
+    return;
+  }
+
+  const { age_threshold_hours, escalation_target_role, escalation_target_user_id } = parse.data;
+
+  // Validate specific_user requires escalation_target_user_id
+  if (escalation_target_role === 'specific_user' && !escalation_target_user_id) {
+    res.status(400).json({ error: 'escalation_target_user_id required for specific_user role' });
+    return;
+  }
+
+  const result = await pool.query(
+    `INSERT INTO compliance_escalation_rules
+       (surety_id, age_threshold_hours, escalation_target_role, escalation_target_user_id, is_active)
+     VALUES ($1, $2, $3, $4, TRUE)
+     RETURNING id, surety_id, age_threshold_hours, escalation_target_role,
+               escalation_target_user_id, is_active, created_at, updated_at`,
+    [user.id, age_threshold_hours, escalation_target_role, escalation_target_user_id ?? null]
+  );
+
+  res.status(201).json({ rule: result.rows[0] });
+});
+
+// PUT /api/v1/compliance/escalation-rules/:id — update escalation rule
+complianceRouter.put('/escalation-rules/:id', async (req: Request, res: Response) => {
+  const user = (req as AuthedRequest).user;
+
+  const parse = z
+    .object({
+      age_threshold_hours: z.number().int().positive().max(720).optional(),
+      escalation_target_role: z.enum(['senior_admin', 'specific_user']).optional(),
+      escalation_target_user_id: z.string().uuid().optional().nullable(),
+      is_active: z.boolean().optional(),
+    })
+    .safeParse(req.body);
+
+  if (!parse.success) {
+    res.status(400).json({ error: 'invalid input', details: parse.error });
+    return;
+  }
+
+  // Check rule exists and belongs to this surety
+  const existing = await pool.query(
+    `SELECT id FROM compliance_escalation_rules WHERE id = $1 AND surety_id = $2`,
+    [req.params.id, user.id]
+  );
+
+  if (!existing.rowCount) {
+    res.status(404).json({ error: 'escalation rule not found' });
+    return;
+  }
+
+  const updates: string[] = ['updated_at = now()'];
+  const params: unknown[] = [];
+  let idx = 1;
+
+  if (parse.data.age_threshold_hours !== undefined) {
+    updates.push(`age_threshold_hours = $${idx++}`);
+    params.push(parse.data.age_threshold_hours);
+  }
+  if (parse.data.escalation_target_role !== undefined) {
+    updates.push(`escalation_target_role = $${idx++}`);
+    params.push(parse.data.escalation_target_role);
+  }
+  if (parse.data.escalation_target_user_id !== undefined) {
+    updates.push(`escalation_target_user_id = $${idx++}`);
+    params.push(parse.data.escalation_target_user_id);
+  }
+  if (parse.data.is_active !== undefined) {
+    updates.push(`is_active = $${idx++}`);
+    params.push(parse.data.is_active);
+  }
+
+  params.push(req.params.id);
+  const result = await pool.query(
+    `UPDATE compliance_escalation_rules
+     SET ${updates.join(', ')}
+     WHERE id = $${idx}
+     RETURNING id, surety_id, age_threshold_hours, escalation_target_role,
+               escalation_target_user_id, is_active, created_at, updated_at`,
+    params
+  );
+
+  res.json({ rule: result.rows[0] });
+});
+
+// DELETE /api/v1/compliance/escalation-rules/:id — delete escalation rule
+complianceRouter.delete('/escalation-rules/:id', async (req: Request, res: Response) => {
+  const user = (req as AuthedRequest).user;
+
+  const result = await pool.query(
+    `DELETE FROM compliance_escalation_rules
+     WHERE id = $1 AND surety_id = $2
+     RETURNING id`,
+    [req.params.id, user.id]
+  );
+
+  if (!result.rowCount) {
+    res.status(404).json({ error: 'escalation rule not found' });
+    return;
+  }
+
+  res.json({ success: true });
+});
+
+// GET /api/v1/compliance/escalation-history/:flagId — get escalation history for a flag
+complianceRouter.get('/escalation-history/:flagId', async (req: Request, res: Response) => {
+  const user = (req as AuthedRequest).user;
+
+  // Verify flag belongs to this surety
+  const flag = await pool.query(
+    `SELECT id FROM compliance_flags WHERE id = $1 AND surety_id = $2`,
+    [req.params.flagId, user.id]
+  );
+
+  if (!flag.rowCount) {
+    res.status(404).json({ error: 'flag not found' });
+    return;
+  }
+
+  const history = await pool.query(
+    `SELECT eh.id, eh.flag_id, eh.escalation_rule_id, eh.previous_assignee,
+            eh.new_assignee, eh.escalated_at,
+            er.age_threshold_hours
+     FROM compliance_escalation_history eh
+     JOIN compliance_escalation_rules er ON er.id = eh.escalation_rule_id
+     WHERE eh.flag_id = $1
+     ORDER BY eh.escalated_at DESC`,
+    [req.params.flagId]
+  );
+
+  res.json({ history: history.rows });
+});
+
+// ── Importer Risk Scoring Dashboard & Drill-Down Analytics (#1027) ─────────
+
+// GET /api/v1/compliance/risk-scores — Ranked Importers by Risk Score (descending)
+complianceRouter.get('/risk-scores', async (req: Request, res: Response) => {
+  try {
+    const result = await pool.query(
+      `SELECT rs.importer_id, i.legal_name, i.bond_id, rs.risk_score, rs.risk_level,
+              rs.contributing_factors, rs.calculated_at
+       FROM importer_risk_scores rs
+       JOIN importers i ON i.id = rs.importer_id
+       ORDER BY rs.risk_score DESC`
+    );
+    res.json({ importers: result.rows });
+  } catch (err: any) {
+    console.error('[compliance] failed to fetch risk scores:', err);
+    res.status(500).json({ error: 'failed to fetch risk scores' });
+  }
+});
+
+// GET /api/v1/compliance/risk-scores/:importerId/drill-down — Detailed Factors & Historical Trend
+complianceRouter.get('/risk-scores/:importerId/drill-down', async (req: Request, res: Response) => {
+  const { importerId } = req.params;
+
+  try {
+    const [scoreRes, trendRes] = await Promise.all([
+      pool.query(
+        `SELECT rs.*, i.legal_name
+         FROM importer_risk_scores rs
+         JOIN importers i ON i.id = rs.importer_id
+         WHERE rs.importer_id = $1`,
+        [importerId]
+      ),
+      pool.query(
+        `SELECT risk_score, calculated_at
+         FROM importer_risk_trends
+         WHERE importer_id = $1
+         ORDER BY calculated_at ASC
+         LIMIT 90`,
+        [importerId]
+      ),
+    ]);
+
+    if (!scoreRes.rowCount) {
+      res.status(404).json({ error: 'risk score profile not found' });
+      return;
+    }
+
+    res.json({
+      importerId,
+      legalName: scoreRes.rows[0].legal_name,
+      riskScore: scoreRes.rows[0].risk_score,
+      riskLevel: scoreRes.rows[0].risk_level,
+      factors: scoreRes.rows[0].contributing_factors,
+      lastCalculatedAt: scoreRes.rows[0].calculated_at,
+      trend: trendRes.rows,
+    });
+  } catch (err: any) {
+    console.error('[compliance] failed to query risk score drill-down:', err);
+    res.status(500).json({ error: 'failed to query risk score details' });
+  }
+});
+
+/**
+ * Scheduled background task to recalculate risk scores across importers
+ */
+export async function recalculateImporterRiskScores() {
+  try {
+    const importers = await pool.query(`SELECT id FROM importers WHERE deleted_at IS NULL`);
+
+    for (const row of importers.rows) {
+      const importerId = row.id;
+
+      // 1. Fetch active compliance flags
+      const flagsRes = await pool.query(
+        `SELECT severity, COUNT(*) as cnt
+         FROM compliance_flags
+         WHERE importer_id = $1 AND resolution_status = 'open'
+         GROUP BY severity`,
+        [importerId]
+      );
+
+      let flagPoints = 0;
+      const flagCounts: Record<string, number> = { critical: 0, high: 0, medium: 0, low: 0 };
+      for (const f of flagsRes.rows) {
+        const cnt = parseInt(f.cnt, 10);
+        flagCounts[f.severity] = cnt;
+        if (f.severity === 'critical') flagPoints += cnt * 35;
+        if (f.severity === 'high') flagPoints += cnt * 20;
+        if (f.severity === 'medium') flagPoints += cnt * 10;
+        if (f.severity === 'low') flagPoints += cnt * 5;
+      }
+      const flagScore = Math.min(100, flagPoints);
+
+      // 2. Fetch collateral health ratio
+      const bondRes = await pool.query(
+        `SELECT bond_amount, cbp_minimum_required FROM bond_records WHERE importer_id = $1 ORDER BY created_at DESC LIMIT 1`,
+        [importerId]
+      );
+      let healthScore = 100;
+      if (bondRes.rowCount) {
+        const bAmount = BigInt(bondRes.rows[0].bond_amount || '1');
+        const reqAmount = BigInt(bondRes.rows[0].cbp_minimum_required || '1');
+        const ratio = Number((bAmount * 100n) / (reqAmount === 0n ? 1n : reqAmount));
+        healthScore = Math.min(100, ratio);
+      }
+      const unhealthScore = Math.max(0, 100 - healthScore);
+
+      // 3. Fetch dispute count
+      const disputeRes = await pool.query(
+        `SELECT COUNT(*) as cnt FROM compliance_flags WHERE importer_id = $1 AND flag_type = 'dispute'`,
+        [importerId]
+      );
+      const disputeCount = parseInt(disputeRes.rows[0]?.cnt || '0', 10);
+      const disputeScore = Math.min(100, disputeCount * 20);
+
+      // 4. Compute composite risk score (0-100)
+      const compositeScore = Math.min(100, Math.round(flagScore * 0.4 + unhealthScore * 0.4 + disputeScore * 0.2));
+      const riskLevel = compositeScore >= 75 ? 'critical' : compositeScore >= 50 ? 'high' : compositeScore >= 25 ? 'medium' : 'low';
+
+      const contributingFactors = {
+        flagCounts,
+        flagScoreContribution: Math.round(flagScore * 0.4),
+        healthScore,
+        unhealthScoreContribution: Math.round(unhealthScore * 0.4),
+        disputeCount,
+        disputeScoreContribution: Math.round(disputeScore * 0.2),
+      };
+
+      await pool.query(
+        `INSERT INTO importer_risk_scores (importer_id, risk_score, risk_level, contributing_factors, calculated_at)
+         VALUES ($1, $2, $3, $4::jsonb, NOW())
+         ON CONFLICT (importer_id) DO UPDATE SET
+           risk_score = EXCLUDED.risk_score,
+           risk_level = EXCLUDED.risk_level,
+           contributing_factors = EXCLUDED.contributing_factors,
+           calculated_at = NOW()`,
+        [importerId, compositeScore, riskLevel, JSON.stringify(contributingFactors)]
+      );
+
+      await pool.query(
+        `INSERT INTO importer_risk_trends (importer_id, risk_score, calculated_at)
+         VALUES ($1, $2, NOW())`,
+        [importerId, compositeScore]
+      );
+    }
+  } catch (err: any) {
+    console.error('[compliance] error calculating importer risk scores:', err);
+  }
+}
+

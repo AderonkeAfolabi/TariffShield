@@ -5,6 +5,7 @@ import { pool } from './db.js';
 import { contractClient, platformKeypair, suretyKeypair } from './stellar.js';
 import { Keypair } from '@stellar/stellar-sdk';
 import { invalidateOnChainAccount } from './cache.js';
+import { dispatchWebhookEvent } from './services/webhooks.js';
 
 export interface TxSubmitJobData {
   method:
@@ -182,6 +183,25 @@ export function createTxSubmitWorker() {
         await invalidateOnChainAccount(importerId);
       }
 
+      // #1023: Dispatch outbound webhooks for subscribed events
+      if (method === 'deposit') {
+        dispatchWebhookEvent(importerId, 'deposit', {
+          amount: eventAmount,
+          txHash: onChain.txHash,
+          bucket: args.bucket || 'collateral',
+        }).catch(() => {});
+      } else if (method === 'auto_top_up') {
+        dispatchWebhookEvent(importerId, 'top_up', {
+          amount: eventAmount,
+          txHash: onChain.txHash,
+        }).catch(() => {});
+      } else if (method === 'clawback') {
+        dispatchWebhookEvent(importerId, 'clawback', {
+          amount: eventAmount,
+          txHash: onChain.txHash,
+        }).catch(() => {});
+      }
+
       return {
         txHash: onChain.txHash,
         txUrl: explorerTx(onChain.txHash),
@@ -189,6 +209,17 @@ export function createTxSubmitWorker() {
         applicationOrder: onChain.applicationOrder,
       };
     },
-    { connection }
+    {
+      connection,
+      // BullMQ defaults Worker concurrency to 1, which serializes every
+      // queued deposit/withdraw/auto_top_up submission behind a single
+      // in-flight job even when the jobs touch unrelated importer
+      // accounts. That default was the dominant throughput bottleneck
+      // identified in the investigation for issue #1089; see
+      // docs/investigations/deposit-collateral-throughput.md for the
+      // ledger-level analysis of the (much smaller) ceiling that remains
+      // once this is raised.
+      concurrency: env.TX_SUBMIT_WORKER_CONCURRENCY,
+    }
   );
 }

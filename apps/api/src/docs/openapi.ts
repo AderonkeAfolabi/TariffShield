@@ -23,6 +23,9 @@ export const openApiSpec = {
       description: 'Importer account lifecycle and on-chain collateral operations',
     },
     { name: 'KYC', description: 'Know-Your-Customer document submission and review' },
+    { name: 'Credit Lines', description: 'Importer credit-line pre-approvals (#1007)' },
+    { name: 'Disputes', description: 'Collateral dispute recommendations and resolution (#1008)' },
+    { name: 'Approvals', description: 'Configurable multi-step surety approval chains (#1009)' },
     {
       name: 'Compliance',
       description: 'AML/OFAC flags and periodic compliance reports (surety admin)',
@@ -45,6 +48,11 @@ export const openApiSpec = {
         required: ['error'],
         properties: {
           error: { type: 'string', example: 'invalid input' },
+          target: {
+            type: 'string',
+            enum: ['body', 'query'],
+            description: 'On validation failures, which part of the request failed schema validation',
+          },
           details: { type: 'array', items: { type: 'object' } },
         },
       },
@@ -147,20 +155,22 @@ export const openApiSpec = {
       get: {
         tags: ['Health'],
         summary: 'Liveness probe',
-        description: 'Returns 200 OK as long as the Node.js process is running.',
+        description:
+          'Returns 200 with `{ "status": "ok" }` as long as the Node.js process is running.',
         security: [],
-        responses: { 200: { description: 'Process alive' } },
+        responses: { 200: { description: 'Process alive — `{ "status": "ok" }`' } },
       },
     },
     '/health/ready': {
       get: {
         tags: ['Health'],
         summary: 'Readiness probe',
-        description: 'Returns 200 only when Postgres and Soroban RPC are reachable.',
+        description:
+          'Returns 200 only when Postgres, Soroban RPC and Redis are reachable. The body is `{ "status": "ok" }` on success and `{ "status": "degraded" }` on 503.',
         security: [],
         responses: {
-          200: { description: 'Service ready to handle traffic' },
-          503: { description: 'Service not yet ready' },
+          200: { description: 'Service ready to handle traffic — `{ "status": "ok" }`' },
+          503: { description: 'Service not yet ready — `{ "status": "degraded" }`' },
         },
       },
     },
@@ -617,6 +627,300 @@ export const openApiSpec = {
         },
       },
     },
+    '/importers/{id}/kyc/batch': {
+      post: {
+        tags: ['KYC'],
+        summary: 'Bulk drag-and-drop KYC document upload (#1006)',
+        description:
+          'Accepts up to 10 files in one request. Each file is processed individually; per-file status is success, failed or virus-scan-pending. The single-file POST /importers/{id}/kyc endpoint remains supported.',
+        parameters: [
+          { name: 'id', in: 'path', required: true, schema: { type: 'string', format: 'uuid' } },
+        ],
+        requestBody: {
+          required: true,
+          content: {
+            'application/json': {
+              schema: {
+                type: 'object',
+                required: ['documents'],
+                properties: {
+                  documents: {
+                    type: 'array',
+                    maxItems: 10,
+                    items: {
+                      type: 'object',
+                      required: ['documentType', 'fileBase64', 'mimeType'],
+                      properties: {
+                        documentType: {
+                          type: 'string',
+                          enum: [
+                            'articles_of_incorporation',
+                            'ein_confirmation',
+                            'beneficial_ownership_fincen_102',
+                          ],
+                        },
+                        fileBase64: { type: 'string' },
+                        mimeType: {
+                          type: 'string',
+                          enum: ['application/pdf', 'image/png', 'image/jpeg'],
+                        },
+                        fileName: { type: 'string' },
+                      },
+                    },
+                  },
+                },
+              },
+            },
+          },
+        },
+        responses: {
+          201: {
+            description:
+              'Per-file results: { results: [{ index, fileName, documentType, status, virusScanStatus, document?, error? }], succeeded, failed, pending }',
+          },
+          404: { description: 'Importer not found' },
+        },
+      },
+    },
+    '/admin/credit-lines': {
+      get: {
+        tags: ['Credit Lines'],
+        summary: 'List credit lines (#1007)',
+        parameters: [
+          { name: 'importer_id', in: 'query', schema: { type: 'string', format: 'uuid' } },
+          {
+            name: 'status',
+            in: 'query',
+            schema: { type: 'string', enum: ['active', 'expired', 'revoked'] },
+          },
+        ],
+        responses: {
+          200: { description: '{ creditLines: [...] }' },
+          403: { description: 'Insufficient role' },
+        },
+      },
+      post: {
+        tags: ['Credit Lines'],
+        summary: 'Grant a time-boxed credit line to an importer (#1007)',
+        requestBody: {
+          required: true,
+          content: {
+            'application/json': {
+              schema: {
+                type: 'object',
+                required: ['importerId', 'amount'],
+                properties: {
+                  importerId: { type: 'string', format: 'uuid' },
+                  amount: { type: 'string', description: 'stroops (integer string)' },
+                  expiresAt: { type: 'string', format: 'date-time' },
+                  durationHours: { type: 'integer', minimum: 1 },
+                  reason: { type: 'string' },
+                },
+              },
+            },
+          },
+        },
+        responses: {
+          201: { description: '{ creditLine }' },
+          400: { description: 'invalid input' },
+          403: { description: 'Insufficient role' },
+        },
+      },
+    },
+    '/admin/credit-lines/{id}/revoke': {
+      post: {
+        tags: ['Credit Lines'],
+        summary: 'Revoke an active credit line (#1007)',
+        parameters: [
+          { name: 'id', in: 'path', required: true, schema: { type: 'string', format: 'uuid' } },
+        ],
+        responses: {
+          200: { description: '{ creditLine }' },
+          404: { description: 'Active credit line not found' },
+        },
+      },
+    },
+    '/importers/{id}/collateral-health': {
+      get: {
+        tags: ['Credit Lines'],
+        summary: 'Credit-line-aware collateral health check (#1007)',
+        description:
+          'Active credit lines count as temporary coverage of any shortfall; expired or revoked lines are excluded so the strict requirement applies again.',
+        parameters: [
+          { name: 'id', in: 'path', required: true, schema: { type: 'string', format: 'uuid' } },
+        ],
+        responses: {
+          200: { description: '{ health, strict }' },
+          404: { description: 'Importer not found' },
+        },
+      },
+    },
+    '/admin/disputes': {
+      get: {
+        tags: ['Disputes'],
+        summary: 'List open collateral disputes (#1008)',
+        responses: {
+          200: { description: '{ disputes: [...] }' },
+          403: { description: 'Insufficient role' },
+        },
+      },
+    },
+    '/admin/disputes/{importerId}/recommendation': {
+      get: {
+        tags: ['Disputes'],
+        summary: 'Advisory dispute-resolution recommendation (#1008)',
+        description:
+          'Suggests accept/reject with supporting factors. Advisory only — never resolves the dispute. See docs/dispute-recommendation.md.',
+        parameters: [
+          {
+            name: 'importerId',
+            in: 'path',
+            required: true,
+            schema: { type: 'string', format: 'uuid' },
+          },
+        ],
+        responses: {
+          200: { description: '{ recommendation }' },
+          404: { description: 'Importer not found' },
+        },
+      },
+    },
+    '/admin/disputes/{id}/resolve': {
+      post: {
+        tags: ['Disputes'],
+        summary: 'Explicitly resolve a dispute on-chain (#1008)',
+        parameters: [
+          { name: 'id', in: 'path', required: true, schema: { type: 'string', format: 'uuid' } },
+        ],
+        requestBody: {
+          required: true,
+          content: {
+            'application/json': {
+              schema: {
+                type: 'object',
+                required: ['accept'],
+                properties: {
+                  accept: {
+                    type: 'boolean',
+                    description: 'true = keep new requirement; false = revert to pre-dispute',
+                  },
+                  note: { type: 'string' },
+                },
+              },
+            },
+          },
+        },
+        responses: {
+          200: { description: '{ dispute, txUrl }' },
+          404: { description: 'Dispute not found' },
+          409: { description: 'Dispute is not open' },
+        },
+      },
+    },
+    '/importers/admin/approval-chains': {
+      get: {
+        tags: ['Approvals'],
+        summary: 'List approval chain versions (#1009)',
+        responses: {
+          200: { description: '{ chains: [...] }' },
+          403: { description: 'Insufficient role' },
+        },
+      },
+      post: {
+        tags: ['Approvals'],
+        summary: 'Create the next version of an approval chain (#1009)',
+        requestBody: {
+          required: true,
+          content: {
+            'application/json': {
+              schema: {
+                type: 'object',
+                required: ['name', 'steps'],
+                properties: {
+                  name: { type: 'string' },
+                  steps: {
+                    type: 'array',
+                    items: {
+                      type: 'object',
+                      required: ['name', 'requiredRole'],
+                      properties: {
+                        name: { type: 'string' },
+                        requiredRole: {
+                          type: 'string',
+                          enum: ['underwriter', 'compliance_officer', 'surety_admin'],
+                        },
+                      },
+                    },
+                  },
+                },
+              },
+            },
+          },
+        },
+        responses: {
+          201: { description: '{ chain }' },
+          403: { description: 'Insufficient role' },
+        },
+      },
+    },
+    '/importers/admin/{id}/review/start': {
+      post: {
+        tags: ['Approvals'],
+        summary: 'Start a multi-step review chain for an importer (#1009)',
+        parameters: [
+          { name: 'id', in: 'path', required: true, schema: { type: 'string', format: 'uuid' } },
+        ],
+        responses: {
+          201: { description: '{ approval }' },
+          400: { description: 'No active approval chain configured' },
+          409: { description: 'A review is already in progress' },
+        },
+      },
+    },
+    '/importers/admin/{id}/review/decision': {
+      post: {
+        tags: ['Approvals'],
+        summary: 'Record the current approval step decision (#1009)',
+        description:
+          'Each step must be approved by a different surety admin. Approval finalises only when every step approves; any rejection halts the chain and notifies the importer.',
+        parameters: [
+          { name: 'id', in: 'path', required: true, schema: { type: 'string', format: 'uuid' } },
+        ],
+        requestBody: {
+          required: true,
+          content: {
+            'application/json': {
+              schema: {
+                type: 'object',
+                required: ['decision'],
+                properties: {
+                  decision: { type: 'string', enum: ['approved', 'rejected'] },
+                  note: { type: 'string' },
+                },
+              },
+            },
+          },
+        },
+        responses: {
+          200: { description: '{ approval, finalized, halted, importerKycStatus }' },
+          403: { description: 'Same approver cannot decide two steps' },
+          404: { description: 'No review in progress' },
+        },
+      },
+    },
+    '/importers/admin/{id}/review': {
+      get: {
+        tags: ['Approvals'],
+        summary: 'Single-query importer review + approval chain state (#244, #1009)',
+        parameters: [
+          { name: 'id', in: 'path', required: true, schema: { type: 'string', format: 'uuid' } },
+        ],
+        responses: {
+          200: { description: '{ review, approval }' },
+          404: { description: 'Importer not found' },
+        },
+      },
+    },
     '/compliance/dashboard': {
       get: {
         tags: ['Compliance'],
@@ -725,6 +1029,128 @@ export const openApiSpec = {
         responses: {
           200: { description: 'Report file (PDF or CSV)' },
           404: { description: 'Report not found' },
+        },
+      },
+    },
+    '/compliance/report-schedules': {
+      get: {
+        tags: ['Compliance'],
+        summary: 'List scheduled report deliveries',
+        responses: {
+          200: { description: 'Report schedules for this surety' },
+          403: { description: 'Insufficient role' },
+        },
+      },
+      post: {
+        tags: ['Compliance'],
+        summary: 'Create a scheduled report delivery',
+        description:
+          'Generates the report type on a weekly (Mondays) or monthly (1st) cadence at 06:00 UTC and emails each recipient a unique, expiring download link. Failed sends are retried with backoff.',
+        requestBody: {
+          required: true,
+          content: {
+            'application/json': {
+              schema: {
+                type: 'object',
+                properties: {
+                  report_type: { type: 'string', enum: ['compliance_summary'] },
+                  cadence: { type: 'string', enum: ['weekly', 'monthly'] },
+                  recipients: {
+                    type: 'array',
+                    items: { type: 'string', format: 'email' },
+                    minItems: 1,
+                    maxItems: 20,
+                  },
+                },
+                required: ['report_type', 'cadence', 'recipients'],
+              },
+            },
+          },
+        },
+        responses: {
+          201: { description: 'Schedule created' },
+          400: { description: 'Invalid input' },
+          403: { description: 'Insufficient role' },
+        },
+      },
+    },
+    '/compliance/report-schedules/{id}': {
+      put: {
+        tags: ['Compliance'],
+        summary: 'Edit, pause or resume a report schedule',
+        parameters: [
+          { name: 'id', in: 'path', required: true, schema: { type: 'string', format: 'uuid' } },
+        ],
+        requestBody: {
+          required: true,
+          content: {
+            'application/json': {
+              schema: {
+                type: 'object',
+                properties: {
+                  report_type: { type: 'string', enum: ['compliance_summary'] },
+                  cadence: { type: 'string', enum: ['weekly', 'monthly'] },
+                  recipients: {
+                    type: 'array',
+                    items: { type: 'string', format: 'email' },
+                    minItems: 1,
+                    maxItems: 20,
+                  },
+                  is_paused: { type: 'boolean' },
+                },
+              },
+            },
+          },
+        },
+        responses: {
+          200: { description: 'Schedule updated' },
+          400: { description: 'Invalid input' },
+          404: { description: 'Schedule not found' },
+        },
+      },
+      delete: {
+        tags: ['Compliance'],
+        summary: 'Delete a report schedule',
+        parameters: [
+          { name: 'id', in: 'path', required: true, schema: { type: 'string', format: 'uuid' } },
+        ],
+        responses: {
+          200: { description: 'Schedule deleted; previously generated reports are kept' },
+          404: { description: 'Schedule not found' },
+        },
+      },
+    },
+    '/compliance/report-schedules/{id}/deliveries': {
+      get: {
+        tags: ['Compliance'],
+        summary: 'Delivery log for a report schedule',
+        parameters: [
+          { name: 'id', in: 'path', required: true, schema: { type: 'string', format: 'uuid' } },
+          {
+            name: 'status',
+            in: 'query',
+            schema: { type: 'string', enum: ['pending', 'sent', 'failed'] },
+          },
+          { name: 'limit', in: 'query', schema: { type: 'integer', maximum: 100, default: 50 } },
+          { name: 'offset', in: 'query', schema: { type: 'integer', default: 0 } },
+        ],
+        responses: {
+          200: { description: 'Deliveries with attempt count and last error' },
+          404: { description: 'Schedule not found' },
+        },
+      },
+    },
+    '/compliance-report-links/{token}': {
+      get: {
+        tags: ['Compliance'],
+        summary: 'Open an emailed report download link',
+        description:
+          'Unauthenticated; the token is the credential. Redirects to a short-lived pre-signed report URL.',
+        security: [],
+        parameters: [{ name: 'token', in: 'path', required: true, schema: { type: 'string' } }],
+        responses: {
+          302: { description: 'Redirect to the report PDF' },
+          404: { description: 'Link unknown, expired, or report PDF unavailable' },
         },
       },
     },

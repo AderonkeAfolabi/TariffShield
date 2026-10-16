@@ -4,12 +4,16 @@
 // rather than clippy's uniform 3-digit grouping.
 #![allow(clippy::inconsistent_digit_grouping)]
 
+extern crate std;
+
 use super::*;
 use soroban_sdk::{
     testutils::{Address as _, Ledger},
     token::{StellarAssetClient, TokenClient},
+    xdr::ToXdr,
     Env, IntoVal,
 };
+use std::time::Instant;
 
 struct Setup<'a> {
     env: Env,
@@ -892,4 +896,305 @@ fn non_admin_cannot_transfer_admin() {
     }]);
 
     client.transfer_admin(&intruder);
+}
+
+fn benchmark_importer_batch(
+    count: usize,
+    action: impl Fn(&Setup<'_>, &Address),
+) -> (u128, u64, u64) {
+    let s = setup();
+    let mut importers = std::vec::Vec::with_capacity(count);
+    for _ in 0..count {
+        importers.push(Address::generate(&s.env));
+    }
+
+    for (i, importer) in importers.iter().enumerate() {
+        s.client
+            .register_importer(importer, &(10_000 + i as u64), &100_000_0000000);
+        s.client
+            .deposit_collateral(importer, &s.funder, &10_000_0000);
+        s.client.deposit_reserve(importer, &s.funder, &10_000_0000);
+    }
+
+    let mut budget = s.env.cost_estimate().budget();
+    budget.reset_unlimited();
+    budget.reset_tracker();
+
+    let start = Instant::now();
+    for importer in &importers {
+        action(&s, importer);
+    }
+    let elapsed_ns = start.elapsed().as_nanos();
+    (
+        elapsed_ns,
+        budget.cpu_instruction_cost(),
+        budget.memory_bytes_cost(),
+    )
+}
+
+#[test]
+fn benchmark_bulk_enforcement_paths() {
+    let clawback_one = benchmark_importer_batch(1, |s, importer| {
+        let _ = s.client.clawback(importer);
+    });
+    let clawback_100 = benchmark_importer_batch(100, |s, importer| {
+        let _ = s.client.clawback(importer);
+    });
+    let clawback_1000 = benchmark_importer_batch(1000, |s, importer| {
+        let _ = s.client.clawback(importer);
+    });
+
+    let stale_100 = benchmark_importer_batch(100, |s, importer| {
+        let _ = s.client.is_collateral_stale(importer);
+    });
+    let stale_1000 = benchmark_importer_batch(1000, |s, importer| {
+        let _ = s.client.is_collateral_stale(importer);
+    });
+
+    let s = setup();
+    let mut history_stats = std::vec::Vec::new();
+    for entry_count in [10usize, 100, 1000] {
+        let importer = Address::generate(&s.env);
+        s.client.register_importer(
+            &importer,
+            &((entry_count as u64) + 20_000),
+            &100_000_0000000,
+        );
+        for i in 0..entry_count {
+            s.env.ledger().with_mut(|li| {
+                li.timestamp = 1_000_000 + i as u64;
+            });
+            s.client.set_required_collateral(
+                &s.emergency_oracle_admin,
+                &importer,
+                &((100_000_0000000i128) + (i as i128) * 1_000_0000),
+                &None,
+                &false,
+                &true,
+            );
+        }
+        let mut budget = s.env.cost_estimate().budget();
+        budget.reset_unlimited();
+        budget.reset_tracker();
+        let start = Instant::now();
+        let history = s.client.get_collateral_history(&importer);
+        let encoded = history.to_xdr(&s.env);
+        let elapsed_ns = start.elapsed().as_nanos();
+        history_stats.push((
+            entry_count as u64,
+            elapsed_ns,
+            budget.cpu_instruction_cost(),
+            budget.memory_bytes_cost(),
+            encoded.len() as u64,
+        ));
+    }
+
+    let mut signer_stats = std::vec::Vec::new();
+    for signer_count in [3usize, 5, 7] {
+        let mut current_signers = soroban_sdk::Vec::new(&s.env);
+        for _ in 0..signer_count {
+            current_signers.push_back(Address::generate(&s.env));
+        }
+        s.env
+            .storage()
+            .instance()
+            .set(&DataKey::OracleSigners, &current_signers);
+        s.env
+            .storage()
+            .instance()
+            .set(&DataKey::OracleThreshold, &2u32);
+
+        let mut new_signers = soroban_sdk::Vec::new(&s.env);
+        for _ in 0..3 {
+            new_signers.push_back(Address::generate(&s.env));
+        }
+        let approvals = current_signers.clone();
+        let mut budget = s.env.cost_estimate().budget();
+        budget.reset_unlimited();
+        budget.reset_tracker();
+        let start = Instant::now();
+        s.client.update_oracle_signers(&new_signers, &approvals);
+        let elapsed_ns = start.elapsed().as_nanos();
+        signer_stats.push((
+            signer_count as u64,
+            elapsed_ns,
+            budget.cpu_instruction_cost(),
+            budget.memory_bytes_cost(),
+        ));
+    }
+
+    std::println!(
+        "clawback: 1={:?} 100={:?} 1000={:?}",
+        clawback_one,
+        clawback_100,
+        clawback_1000
+    );
+    std::println!("stale: 100={:?} 1000={:?}", stale_100, stale_1000);
+    std::println!("history: {:?}", history_stats);
+    std::println!("signers: {:?}", signer_stats);
+
+    assert!(clawback_100.0 >= clawback_one.0);
+    assert!(clawback_1000.0 >= clawback_100.0);
+    assert!(stale_1000.0 >= stale_100.0);
+}
+
+#[test]
+fn benchmark_register_importer_scaling() {
+    let s = setup();
+    let target_sizes = [100, 1000, 10000];
+    let mut current_importers_count = 0;
+
+    for size in target_sizes {
+        s.env.as_contract(&s.contract_id, || {
+            while current_importers_count < size {
+                let importer = Address::generate(&s.env);
+                let key = DataKey::Account(importer);
+                let account = Account {
+                    bond_id: current_importers_count as u64 + 50_000,
+                    collateral_balance: 0,
+                    required_collateral: 100_000_0000000,
+                    reserve_balance: 0,
+                    yield_accrued: 0,
+                    is_clawbacked: false,
+                    collateral_last_updated: s.env.ledger().timestamp(),
+                    collateral_history: soroban_sdk::Vec::new(&s.env),
+                    dispute_expires_at: 0,
+                    pre_dispute_required: 100_000_0000000,
+                    dispute_raised: false,
+                    oracle_last_updated: 0,
+                };
+                s.env.storage().persistent().set(&key, &account);
+                current_importers_count += 1;
+            }
+        });
+
+        let next_importer = Address::generate(&s.env);
+        let mut budget = s.env.cost_estimate().budget();
+        budget.reset_unlimited();
+        budget.reset_tracker();
+
+        s.client.register_importer(
+            &next_importer,
+            &((current_importers_count as u64) + 50_000),
+            &100_000_0000000,
+        );
+
+        let cpu = budget.cpu_instruction_cost();
+        let mem = budget.memory_bytes_cost();
+
+        std::println!(
+            "REGISTER_IMPORTER_BENCHMARK: size={}, cpu={}, mem={}",
+            size,
+            cpu,
+            mem
+        );
+
+        current_importers_count += 1;
+    }
+}
+
+// #1127 — cost of a single `deposit_reserve` / `deposit_collateral` call after
+// a varying number of *prior* deposits, to check whether the per-call resource
+// cost grows with the importer's deposit history. Both functions load one
+// fixed-size `DataKey::Account` entry, do a single SAC transfer, and `+=` one
+// balance field before saving the same fixed-size entry — `collateral_history`
+// is only appended to by `set_required_collateral`, never by deposits — so the
+// measured cost is expected to be flat across prior-deposit counts.
+enum DepositKind {
+    Reserve,
+    Collateral,
+}
+
+fn deposit_cost_after_prior_deposits(kind: &DepositKind, prior: usize) -> (u64, u64) {
+    let s = setup();
+    s.client
+        .register_importer(&s.importer, &(900_000 + prior as u64), &1_000_000_0000000);
+
+    let deposit = |s: &Setup, amount: i128| match kind {
+        DepositKind::Reserve => s.client.deposit_reserve(&s.importer, &s.funder, &amount),
+        DepositKind::Collateral => s.client.deposit_collateral(&s.importer, &s.funder, &amount),
+    };
+
+    for _ in 0..prior {
+        deposit(&s, 500_0000); // 0.5 XLM each; 1000 priors = 500 XLM < funder's 1000 XLM
+    }
+
+    let mut budget = s.env.cost_estimate().budget();
+    budget.reset_unlimited();
+    budget.reset_tracker();
+    deposit(&s, 1_000_0000); // the measured (prior+1)-th call
+    (budget.cpu_instruction_cost(), budget.memory_bytes_cost())
+}
+
+// #1127 — isolates the *true* per-call cost from the cumulative test-env event
+// log. The env is set up with one real deposit (to create the token ledger
+// entries), then `prior` further deposits are simulated as plain Account-state
+// rewrites under the same `DataKey::Account(importer)` key (the exact final
+// state N sequential deposits would leave, minus the N published events). The
+// measured call then sees a ledger whose account has {1, 100, 1000} prior
+// deposit history with no host-side event accumulation.
+fn deposit_cost_isolated(kind: &DepositKind, prior: usize) -> (u64, u64) {
+    let s = setup();
+    s.client
+        .register_importer(&s.importer, &(800_000 + prior as u64), &1_000_000_0000000);
+
+    match kind {
+        DepositKind::Reserve => s.client.deposit_reserve(&s.importer, &s.funder, &1_000_0000),
+        DepositKind::Collateral => s.client.deposit_collateral(&s.importer, &s.funder, &1_000_0000),
+    }
+
+    const PER_DEPOSIT: i128 = 1_000_0000;
+    s.env.as_contract(&s.contract_id, || {
+        let key = DataKey::Account(s.importer.clone());
+        let mut acct: Account = s.env.storage().persistent().get(&key).unwrap();
+        let total = PER_DEPOSIT * (prior as i128 + 1);
+        match kind {
+            DepositKind::Reserve => acct.reserve_balance = total,
+            DepositKind::Collateral => acct.collateral_balance = total,
+        }
+        s.env.storage().persistent().set(&key, &acct);
+    });
+
+    let mut budget = s.env.cost_estimate().budget();
+    budget.reset_unlimited();
+    budget.reset_tracker();
+    match kind {
+        DepositKind::Reserve => s.client.deposit_reserve(&s.importer, &s.funder, &PER_DEPOSIT),
+        DepositKind::Collateral => s.client.deposit_collateral(&s.importer, &s.funder, &PER_DEPOSIT),
+    }
+    (budget.cpu_instruction_cost(), budget.memory_bytes_cost())
+}
+
+#[test]
+fn benchmark_deposit_cost_vs_prior_deposit_count() {
+    for kind in [DepositKind::Reserve, DepositKind::Collateral] {
+        for prior in [1usize, 100, 1000] {
+            let (cpu, mem) = deposit_cost_after_prior_deposits(&kind, prior);
+            std::println!(
+                "DEPOSIT_BENCHMARK: kind={}, prior_deposits={}, cpu={}, mem={}",
+                match kind {
+                    DepositKind::Reserve => "reserve",
+                    DepositKind::Collateral => "collateral",
+                },
+                prior,
+                cpu,
+                mem
+            );
+        }
+    }
+    for kind in [DepositKind::Reserve, DepositKind::Collateral] {
+        for prior in [1usize, 100, 1000] {
+            let (cpu, mem) = deposit_cost_isolated(&kind, prior);
+            std::println!(
+                "DEPOSIT_BENCHMARK_ISOLATED: kind={}, prior_deposits={}, cpu={}, mem={}",
+                match kind {
+                    DepositKind::Reserve => "reserve",
+                    DepositKind::Collateral => "collateral",
+                },
+                prior,
+                cpu,
+                mem
+            );
+        }
+    }
 }

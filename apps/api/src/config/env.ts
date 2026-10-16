@@ -43,6 +43,17 @@ export const Env = z.object({
     .describe(
       'Redis connection string, shared by the BullMQ job queue and the on-chain account state cache (#246)'
     ),
+  TX_SUBMIT_WORKER_CONCURRENCY: z.coerce
+    .number()
+    .int()
+    .positive()
+    .default(8)
+    .describe(
+      'Number of tx-submit jobs the BullMQ worker processes concurrently (issue #1089). ' +
+        'Bounded below the Soroban RPC per-account submission ceiling identified in ' +
+        'docs/investigations/deposit-collateral-throughput.md — raising it further shifts ' +
+        'contention onto the shared platform token-balance ledger entry rather than improving throughput.'
+    ),
   FRONTEND_ORIGIN: z
     .string()
     .default('http://localhost:3000')
@@ -190,6 +201,13 @@ export const Env = z.object({
     .email()
     .optional()
     .describe('From address for compliance report notification emails'),
+  API_PUBLIC_URL: z
+    .string()
+    .url()
+    .default('http://localhost:3002')
+    .describe(
+      'Externally reachable base URL of this API, used to build secure download links in scheduled compliance report emails (#1013)'
+    ),
 });
 
 const parsed = Env.safeParse(process.env);

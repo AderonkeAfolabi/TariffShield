@@ -4,17 +4,30 @@ import Link from 'next/link';
 import { useParams, useRouter } from 'next/navigation';
 import { useCallback, useEffect, useState } from 'react';
 import { Nav } from '@/components/Nav';
-import { api, ApiError, type ImporterDetail, type ContractEvent, stroopsToXlm } from '@/lib/api';
+import { ErrorBanner } from '@/components/ErrorBanner';
+import { api, type ImporterDetail, type ContractEvent, stroopsToXlm } from '@/lib/api';
 import { getUser, isAuthenticated } from '@/lib/auth';
+import { formatApiError, type FormattedError } from '@/lib/error-formatter';
+import { getEventAmountLabel } from '@/lib/event-helpers';
 
 export default function SuretyImporterDetail() {
   const params = useParams<{ id: string }>();
   const router = useRouter();
   const [detail, setDetail] = useState<ImporterDetail | null>(null);
   const [events, setEvents] = useState<ContractEvent[]>([]);
-  const [error, setError] = useState<string | null>(null);
+  const [error, setError] = useState<FormattedError | string | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
   const [yieldXlm, setYieldXlm] = useState('1');
+  const [successMessage, setSuccessMessage] = useState<string | null>(null);
+
+  // Clear success message automatically after 5 seconds
+  useEffect(() => {
+    if (!successMessage) return;
+    const timer = setTimeout(() => {
+      setSuccessMessage(null);
+    }, 5000);
+    return () => clearTimeout(timer);
+  }, [successMessage]);
 
   const refresh = useCallback(async () => {
     if (!params?.id) return;
@@ -26,7 +39,7 @@ export default function SuretyImporterDetail() {
       const page = await api.getImporterEventsCursor(params.id);
       setEvents(page.data);
     } catch (e) {
-      setError(e instanceof ApiError ? e.message : String(e));
+      setError(formatApiError(e));
     }
   }, [params?.id]);
 
@@ -46,11 +59,19 @@ export default function SuretyImporterDetail() {
   async function act(name: string, fn: () => Promise<unknown>) {
     setBusy(name);
     setError(null);
+    setSuccessMessage(null);
     try {
       await fn();
       await refresh();
+      if (name === 'yield') {
+        setSuccessMessage(`Simulated yield of ${yieldXlm} XLM successfully accrued.`);
+      } else if (name === 'clawback') {
+        setSuccessMessage(
+          'Emergency clawback successfully executed. Importer account has been frozen.'
+        );
+      }
     } catch (e) {
-      setError(e instanceof ApiError ? e.message : String(e));
+      setError(formatApiError(e));
     } finally {
       setBusy(null);
     }
@@ -73,8 +94,23 @@ export default function SuretyImporterDetail() {
     <>
       <Nav />
       <main className="max-w-4xl mx-auto px-6 py-10">
-        <Link href="/surety" className="text-sm text-accent hover:underline">
-          ← Back to portfolio
+        <Link
+          href="/surety"
+          className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md border border-border bg-card text-xs font-medium text-muted hover:text-accent hover:border-accent/40 transition-colors"
+        >
+          <svg
+            xmlns="http://www.w3.org/2000/svg"
+            viewBox="0 0 20 20"
+            fill="currentColor"
+            className="w-3.5 h-3.5"
+          >
+            <path
+              fillRule="evenodd"
+              d="M17 10a.75.75 0 0 1-.75.75H5.612l4.158 3.96a.75.75 0 1 1-1.04 1.08l-5.5-5.25a.75.75 0 0 1 0-1.08l5.5-5.25a.75.75 0 1 1 1.04 1.08L5.612 9.25H16.25A.75.75 0 0 1 17 10Z"
+              clipRule="evenodd"
+            />
+          </svg>
+          Back to portfolio
         </Link>
 
         <div className="mt-4">
@@ -90,6 +126,8 @@ export default function SuretyImporterDetail() {
         {onc.isClawbacked ? (
           <div className="mt-6 rounded-lg border border-danger bg-danger/10 px-4 py-3 text-sm">
             <strong className="text-danger">Account frozen.</strong> Clawback already executed.
+            Contact the importer and review the on-chain event log below before taking further admin
+            action.
           </div>
         ) : null}
 
@@ -151,6 +189,10 @@ export default function SuretyImporterDetail() {
               Drains <span className="font-mono">{stroopsToXlm(totalAtRisk.toString())} XLM</span>{' '}
               (collateral + reserve) to surety wallet + freezes account. Use on importer default.
             </p>
+            <p className="mt-2 flex items-start gap-1.5 text-xs font-semibold text-danger">
+              <span aria-hidden="true">⚠</span>
+              <span>This action cannot be undone.</span>
+            </p>
             <button
               disabled={busy !== null || onc.isClawbacked || totalAtRisk === 0n}
               onClick={() => act('clawback', () => api.clawback(detail.importer.id))}
@@ -167,11 +209,33 @@ export default function SuretyImporterDetail() {
           </div>
         </div>
 
-        {error ? (
-          <p className="mt-4 rounded border border-danger bg-danger/10 px-3 py-2 text-sm text-danger">
-            {error}
-          </p>
+        {successMessage ? (
+          <div className="mt-4 flex items-center justify-between rounded border border-success bg-success/10 px-3 py-2 text-sm text-success transition-all duration-300">
+            <div className="flex items-center gap-2">
+              <svg
+                xmlns="http://www.w3.org/2000/svg"
+                viewBox="0 0 20 20"
+                fill="currentColor"
+                className="w-5 h-5 flex-shrink-0"
+              >
+                <path
+                  fillRule="evenodd"
+                  d="M10 18a8 8 0 1 0 0-16 8 8 0 0 0 0 16Zm3.857-9.809a.75.75 0 0 0-1.214-.882l-3.483 4.79-1.88-1.88a.75.75 0 1 0-1.06 1.061l2.5 2.5a.75.75 0 0 0 1.137-.089l4-5.5Z"
+                  clipRule="evenodd"
+                />
+              </svg>
+              <span>{successMessage}</span>
+            </div>
+            <button
+              onClick={() => setSuccessMessage(null)}
+              className="text-success hover:opacity-85 text-xs font-semibold focus:outline-none"
+            >
+              Dismiss
+            </button>
+          </div>
         ) : null}
+
+        <ErrorBanner error={error} className="mt-4" />
 
         <div className="mt-10">
           <h2 className="text-sm font-semibold uppercase tracking-wide text-muted">
@@ -187,9 +251,7 @@ export default function SuretyImporterDetail() {
                     <p className="text-sm font-medium">{e.kind}</p>
                     <p className="text-xs text-muted">{new Date(e.createdAt).toLocaleString()}</p>
                   </div>
-                  <span className="text-sm font-mono">
-                    {e.amount ? `${stroopsToXlm(e.amount)} XLM` : '—'}
-                  </span>
+                  <span className="text-sm font-mono">{getEventAmountLabel(e)}</span>
                   {e.txUrl ? (
                     <a
                       href={e.txUrl}
