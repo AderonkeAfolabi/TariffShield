@@ -51,10 +51,10 @@
     ]
   },
   "devDependencies": {
-    "@commitlint/cli": "^19.0.0",
-    "@commitlint/config-conventional": "^19.0.0",
-    "@semantic-release/changelog": "^6.0.0",
-    "@semantic-release/exec": "^6.0.0",
+    "@commitlint/cli": "^19.8.1",
+    "@commitlint/config-conventional": "^19.8.1",
+    "@semantic-release/changelog": "^7.0.0",
+    "@semantic-release/exec": "^7.1.0",
     "@semantic-release/git": "^10.0.0",
     "@semantic-release/github": "^10.0.0",
     "@semantic-release/npm": "^13.1.5",
@@ -76,8 +76,7 @@
   },
   "dependencies": {
     "commander": "^15.0.0",
-    "lightningcss": "^1.33.0",
-    "lightningcss-darwin-arm64": "^1.33.0"
+    "lightningcss": "^1.33.0"
   },
   "overrides": {
     "form-data": "^4.0.6",
@@ -85,7 +84,7 @@
     "shell-quote": "^1.10.0",
     "axios": "^1.19.0",
     "postcss": "^8.5.25",
-    "sharp": "^0.35.3",
+    "sharp": "^0.35.5",
     "brace-expansion": "^2.0.2",
     "js-yaml": "^4.1.1",
     "picomatch": "^4.0.3",

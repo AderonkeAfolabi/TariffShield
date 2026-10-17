@@ -1,274 +1,111 @@
-# Importers API Documentation
+# Importers API
 
-## Overview
+Reference documentation for the importer endpoints in the TariffShield API.
 
-The Importers API provides endpoints for managing importer entities, their compliance documents, activity events, and operational data.
+Base path: `/importers`
 
-## Base URL
-
-All endpoints are prefixed with `/api/v1/importers`
-
-## Authentication
-
-All endpoints require Bearer token authentication via the `Authorization` header:
-
-```
-Authorization: Bearer <your-jwt-token>
-```
+All endpoints require `Authorization: Bearer <token>` and the caller must own the importer (unless noted).
 
 ---
 
-## Documents Management
+## Collateral Status
 
-### POST /importers/:id/documents
+### `GET /importers/:id/collateral-status`
 
-Upload compliance documents for an importer (e.g., licenses, certifications, Form 301).
+Returns the collateral health of an importer's on-chain account, including whether the account is at risk of falling below the required threshold.
 
-**Authorization**: Importer owner or surety admin
+#### Response fields
 
-**Request Format**: `multipart/form-data`
+| Field | Type | Description |
+|-------|------|-------------|
+| `stale` | `boolean` | `true` if the on-chain collateral record has not been updated within 365 days (considered stale) |
+| `lastUpdated` | `string` (ISO 8601) | Timestamp of the last collateral update on-chain |
+| `expiresAt` | `string` (ISO 8601) | Timestamp when the current collateral record expires (`lastUpdated + 365 days`) |
 
-**Parameters**:
-- `id` (path, required): Importer ID
+#### Example — below-threshold (stale) response
 
-**Request Body**:
-- `document` (file, required): The document file to upload
-- `documentType` (string, required): Document classification
-  - Allowed values: `license`, `form_301`, `certification`, `compliance`, `other`
-- `description` (string, optional): Human-readable document description
-- `expiresAt` (ISO 8601 date, optional): Document expiration date
-
-**Accepted File Types**:
-- PDF (`.pdf`)
-- Images: JPEG (`.jpg`, `.jpeg`), PNG (`.png`)
-- Documents: DOCX (`.docx`), DOC (`.doc`)
-
-**File Size Limits**:
-- Maximum file size: 10 MB
-- Files are automatically scanned for viruses before storage
-
-**Example Request**:
-```bash
-curl -X POST https://api.tariffshield.com/api/v1/importers/abc123/documents \
-  -H "Authorization: Bearer <token>" \
-  -F "document=@license.pdf" \
-  -F "documentType=license" \
-  -F "description=Import License 2024" \
-  -F "expiresAt=2024-12-31T23:59:59Z"
-```
-
-**Response** (201 Created):
 ```json
 {
-  "document": {
-    "id": "doc_xyz789",
-    "importerId": "abc123",
-    "documentType": "license",
-    "description": "Import License 2024",
-    "filename": "license.pdf",
-    "fileSize": 245760,
-    "contentType": "application/pdf",
-    "uploadedBy": "user_123",
-    "uploadedAt": "2024-01-15T10:30:00Z",
-    "expiresAt": "2024-12-31T23:59:59Z",
-    "scanStatus": "clean",
-    "s3Key": "encrypted-key"
+  "stale": true,
+  "lastUpdated": "2024-01-15T08:30:00.000Z",
+  "expiresAt": "2025-01-14T08:30:00.000Z"
+}
+```
+
+> **Tip:** If `stale` is `true`, the importer should submit a new tariff CSV upload or deposit additional collateral to refresh the on-chain record. See the [SDK tutorial](../sdk-tutorial.md) for the collateral top-up walkthrough.
+
+---
+
+## Transaction Status Polling
+
+### `GET /importers/:id/tx-status/:jobId`
+
+Async blockchain operations (deposits, auto-top-ups, withdrawals, tariff uploads) return a `jobId` immediately. Poll this endpoint to track the transaction through to completion.
+
+#### Job status values
+
+| State | Meaning | HTTP Status |
+|-------|---------|-------------|
+| `waiting` | Queued, not yet picked up by a worker | 200 |
+| `active` | Worker is processing the transaction | 200 |
+| `completed` | Transaction submitted successfully on-chain | 200 |
+| `failed` | Transaction failed (contract error, timeout, insufficient balance) | 400 |
+
+#### Recommended polling guidance
+
+| Parameter | Recommendation |
+|-----------|---------------|
+| Polling interval | 2–5 seconds |
+| Timeout | 2 minutes (Stellar network typically finalizes in 3–5 seconds) |
+| Max poll attempts | ~24 at 5-second intervals |
+
+After `completed`, the response body contains the transaction hash and result. After `failed`, the response includes an `error` field with the failure reason.
+
+#### Example request/response sequence
+
+**1. Initiate a deposit (returns immediately):**
+
+```
+POST /importers/550e8400-e29b-41d4-a716-446655440000/deposit
+Authorization: Bearer eyJhbGciOi...
+Content-Type: application/json
+
+{ "amountStroops": "500000000", "bucket": "collateral" }
+```
+
+```json
+{
+  "jobId": "job_abc123",
+  "statusUrl": "/importers/550e8400-e29b-41d4-a716-446655440000/tx-status/job_abc123"
+}
+```
+
+**2. Poll the status URL:**
+
+```
+GET /importers/550e8400-e29b-41d4-a716-446655440000/tx-status/job_abc123
+Authorization: Bearer eyJhbGciOi...
+```
+
+**In progress:**
+
+```json
+{ "state": "active", "progress": 50 }
+```
+
+**Completed:**
+
+```json
+{
+  "state": "completed",
+  "result": {
+    "txHash": "a1b2c3d4e5f6...",
+    "txUrl": "https://stellar.expert/explorer/testnet/tx/a1b2c3d4e5f6..."
   }
 }
 ```
 
-**Error Responses**:
-- `400 Bad Request`: Invalid file type or missing required fields
-- `403 Forbidden`: User not authorized to upload documents for this importer
-- `413 Payload Too Large`: File exceeds 10 MB limit
-- `422 Unprocessable Entity`: Virus detected in uploaded file
-
----
-
-### GET /importers/:id/documents
-
-List all documents for an importer with pagination support.
-
-**Authorization**: Importer owner or surety admin
-
-**Parameters**:
-- `id` (path, required): Importer ID
-- `limit` (query, optional): Number of documents per page (default: 20, max: 100)
-- `offset` (query, optional): Number of documents to skip (default: 0)
-- `documentType` (query, optional): Filter by document type
-- `includeExpired` (query, optional): Include expired documents (default: false)
-
-**Example Request**:
-```bash
-curl -X GET "https://api.tariffshield.com/api/v1/importers/abc123/documents?limit=10&documentType=license" \
-  -H "Authorization: Bearer <token>"
-```
-
-**Response** (200 OK):
-```json
-{
-  "documents": [
-    {
-      "id": "doc_xyz789",
-      "importerId": "abc123",
-      "documentType": "license",
-      "description": "Import License 2024",
-      "filename": "license.pdf",
-      "fileSize": 245760,
-      "contentType": "application/pdf",
-      "uploadedBy": "user_123",
-      "uploadedAt": "2024-01-15T10:30:00Z",
-      "expiresAt": "2024-12-31T23:59:59Z",
-      "scanStatus": "clean",
-      "downloadUrl": "https://api.tariffshield.com/api/v1/importers/abc123/documents/doc_xyz789/download"
-    }
-  ],
-  "pagination": {
-    "total": 45,
-    "limit": 10,
-    "offset": 0,
-    "hasMore": true
-  }
-}
-```
-
-**Error Responses**:
-- `403 Forbidden`: User not authorized to view documents for this importer
-- `404 Not Found`: Importer not found
-
----
-
-### DELETE /importers/:id/documents/:docId
-
-Delete an importer document.
-
-**Authorization**: Importer owner or surety admin
-
-**Deletion Behavior**: **Soft delete** — Documents are marked as deleted but retained for audit compliance. Physical deletion occurs after the regulatory retention period (7 years).
-
-**Parameters**:
-- `id` (path, required): Importer ID
-- `docId` (path, required): Document ID
-
-**Example Request**:
-```bash
-curl -X DELETE https://api.tariffshield.com/api/v1/importers/abc123/documents/doc_xyz789 \
-  -H "Authorization: Bearer <token>"
-```
-
-**Response** (200 OK):
-```json
-{
-  "deleted": true,
-  "documentId": "doc_xyz789",
-  "deletedAt": "2024-01-15T11:45:00Z",
-  "deletedBy": "user_123",
-  "retentionUntil": "2031-01-15T11:45:00Z"
-}
-```
-
-**Error Responses**:
-- `403 Forbidden`: User not authorized to delete documents for this importer
-- `404 Not Found`: Document not found or already deleted
-- `409 Conflict`: Document is referenced by active compliance review and cannot be deleted
-
-**Notes**:
-- Deleted documents are excluded from GET /documents responses unless `includeDeleted=true` is specified (admin only)
-- Download URLs for deleted documents return 410 Gone
-- Audit logs retain references to deleted documents
-
----
-
-## Activity Events
-
-### GET /importers/:id/events
-
-Retrieve the activity/audit timeline for an importer.
-
-**Authorization**: Importer owner or surety admin
-
-**Parameters**:
-- `id` (path, required): Importer ID
-- `limit` (query, optional): Events per page (default: 50, max: 200)
-- `offset` (query, optional): Events to skip (default: 0)
-- `eventType` (query, optional): Filter by event type
-- `startDate` (query, optional): Filter events after this date (ISO 8601)
-- `endDate` (query, optional): Filter events before this date (ISO 8601)
-
-**Event Types**:
-- `importer_created`: Importer entity registered
-- `document_uploaded`: Compliance document uploaded
-- `document_deleted`: Document removed
-- `collateral_deposited`: Funds deposited to collateral account
-- `collateral_withdrawn`: Funds withdrawn from collateral
-- `bond_created`: Customs bond issued
-- `bond_updated`: Bond details modified
-- `review_started`: Compliance review initiated
-- `review_approved`: Review approved
-- `review_rejected`: Review rejected
-- `credit_line_granted`: Credit line extended
-- `credit_line_revoked`: Credit line terminated
-- `tariff_uploaded`: Tariff schedule uploaded
-- `alert_triggered`: Tariff spike alert fired
-- `webhook_configured`: Webhook endpoint added
-- `api_key_created`: API key generated
-- `api_key_revoked`: API key disabled
-
-**Example Request**:
-```bash
-curl -X GET "https://api.tariffshield.com/api/v1/importers/abc123/events?limit=20&eventType=document_uploaded&startDate=2024-01-01T00:00:00Z" \
-  -H "Authorization: Bearer <token>"
-```
-
-**Response** (200 OK):
-```json
-{
-  "events": [
-    {
-      "id": "evt_123",
-      "importerId": "abc123",
-      "eventType": "document_uploaded",
-      "timestamp": "2024-01-15T10:30:00Z",
-      "actorId": "user_123",
-      "actorEmail": "importer@example.com",
-      "actorRole": "importer",
-      "metadata": {
-        "documentId": "doc_xyz789",
-        "documentType": "license",
-        "filename": "license.pdf",
-        "fileSize": 245760
-      },
-      "ipAddress": "203.0.113.42"
-    },
-    {
-      "id": "evt_124",
-      "importerId": "abc123",
-      "eventType": "collateral_deposited",
-      "timestamp": "2024-01-15T11:00:00Z",
-      "actorId": "user_123",
-      "actorEmail": "importer@example.com",
-      "actorRole": "importer",
-      "metadata": {
-        "amount": "50000.00",
-        "currency": "USD",
-        "txHash": "abc...def",
-        "stellarAddress": "GABC...XYZ"
-      },
-      "ipAddress": "203.0.113.42"
-    }
-  ],
-  "pagination": {
-    "total": 342,
-    "limit": 20,
-    "offset": 0,
-    "hasMore": true
-  }
-}
-```
-
-**Error Responses**:
-- `403 Forbidden`: User not authorized to view events for this importer
-- `404 Not Found`: Importer not found
+**Failed:**
 
 **Notes**:
 - Events are immutable and retained permanently for regulatory audit
