@@ -25,11 +25,32 @@ import { kycRouter } from './routes/kyc.js';
 import { startComplianceReportScheduler } from './jobs/compliance-report.js';
 import { startImporterMetricsScheduler } from './jobs/refresh-importer-metrics.js';
 import { startContractEventsPartitionScheduler } from './jobs/ensure-contract-events-partitions.js';
+import { startSlaBreachChecker } from './jobs/sla-breach-checker.js';
+import { startCreditLineMonitor } from './jobs/credit-line-monitor.js';
 import { suretyLicenseRouter } from './routes/surety-license.js';
 import { regulatoryRouter } from './routes/regulatory.js';
 import { healthRouter } from './routes/health.js';
 import { httpLogger, logger } from './lib/logger.js';
 import { notificationsRouter } from './routes/notifications.js';
+import { supportTicketsRouter, adminSupportTicketsRouter } from './routes/support-tickets.js';
+import { brokerRouter } from './routes/broker.js';
+import { htsLookupRouter } from './routes/hts-lookup.js';
+import { upgradeSubscriptionsRouter } from './routes/upgrade-subscriptions.js';
+import { bondAnnotationsRouter } from './routes/bond-annotations.js';
+import { slaRouter } from './routes/sla.js';
+import { developerRouter } from './routes/developer.js';
+import { onboardingRouter } from './routes/onboarding.js';
+import { npsRouter } from './routes/nps.js';
+import { reportTemplatesRouter } from './routes/report-templates.js';
+import { brandingRouter, brandingPublicRouter } from './routes/branding.js';
+import { apiKeyUsageMeter } from './services/api-key-usage.js';
+import { startApiKeyUsagePruneScheduler } from './jobs/prune-api-key-usage.js';
+import { startOnboardingDripScheduler } from './services/onboarding-drip.js';
+import { suretyMarketplaceRouter, adminMarketplaceRouter } from './routes/surety-marketplace.js';
+import { startComplianceEscalation } from './jobs/compliance-escalation.js';
+import { startScheduledComplianceReportDelivery } from './jobs/scheduled-compliance-reports.js';
+import { complianceReportLinksRouter } from './routes/compliance-report-links.js';
+import { importerExperienceRouter } from './routes/importer-experience.js';
 
 const app = express();
 app.use(httpLogger);
@@ -250,6 +271,9 @@ app.use(
 
 app.use(express.json({ limit: '1mb' }));
 
+// #1043 — meter traffic that presents a recognised API key (no-op otherwise).
+app.use(apiKeyUsageMeter);
+
 const authLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 20,
@@ -312,16 +336,35 @@ app.use('/auth/login', authLimiter);
 app.use('/auth', authRouter);
 app.use('/importers', importersRouter);
 app.use('/importers', kycRouter);
+app.use('/importers', supportTicketsRouter);
+app.use('/importers', brokerRouter);
+app.use('/importers', htsLookupRouter);
+app.use('/admin', adminSupportTicketsRouter);
 app.use('/compliance', complianceRouter);
+app.use('/compliance-report-links', complianceReportLinksRouter); // unauthenticated, token-gated
 app.use('/admin', adminRouter);
 app.use('/account', privacyRouter);
 app.use('/account', tosRouter);
+app.use('/account/api-keys', apiKeysRouter);
+app.use('/api/v1/account/api-keys', apiKeysRouter);
 app.use('/privacy', privacyRouter);
 app.use('/surety-license', suretyLicenseRouter);
 app.use('/notifications', notificationsRouter);
+app.use('/upgrade-subscriptions', upgradeSubscriptionsRouter);
+app.use('/bond-annotations', bondAnnotationsRouter);
+app.use('/sla', slaRouter);
+app.use('/developer', developerRouter);
+app.use('/onboarding', onboardingRouter);
+app.use('/importer-experience', importerExperienceRouter);
+app.use('/nps', npsRouter);
+app.use('/report-templates', reportTemplatesRouter);
+app.use('/branding/public', brandingPublicRouter); // unauthenticated, presentation-only
+app.use('/branding', brandingRouter);
 app.use('/api/v1/regulatory', regulatoryRouter);
 app.use('/bonds', bondWebhookRouter); // unauthenticated DocuSign webhook
 app.use('/api', bondSignaturesRouter); // authenticated bond signature routes
+app.use('/surety-marketplace', suretyMarketplaceRouter);
+app.use('/surety-marketplace', adminMarketplaceRouter);
 
 Sentry.setupExpressErrorHandler(app);
 
@@ -345,6 +388,14 @@ async function start() {
   startComplianceReportScheduler();
   startImporterMetricsScheduler();
   startContractEventsPartitionScheduler();
+  startSlaBreachChecker();
+  startCreditLineMonitor();
+  startApiKeyUsagePruneScheduler();
+  startOnboardingDripScheduler();
+  startComplianceEscalation();
+  startScheduledComplianceReportDelivery();
+  startScheduledDepositsJob();
+  startScheduledWithdrawalsJob();
   app.listen(env.PORT, () => {
     logger.info(
       {

@@ -1,6 +1,6 @@
 import { Router, type Request, type Response } from 'express';
 import { z } from 'zod';
-import { pool, getStaleAccounts, refreshImporterMetricsView } from '../db.js';
+import { pool, getStaleAccounts, refreshImporterMetricsView, logAudit, createNotification } from '../db.js';
 import {
   authMiddleware,
   requireRole,
@@ -8,8 +8,11 @@ import {
   tosReacceptanceGate,
   type AuthedRequest,
 } from '../auth.js';
-import { platformKeypair, oracleKeypair, contractClient } from '../stellar.js';
+import { platformKeypair, oracleKeypair, contractClient, explorerTx } from '../stellar.js';
 import { bustHtsCache } from '../services/hts-rate-validator.js';
+import { buildDisputeRecommendation } from '../services/dispute-recommendation.js';
+import { NOTIFICATION_KINDS } from '../constants/notification-kinds.js';
+import { s3KeyDecrypt, generatePresignedUrl } from './kyc.js';
 
 export const adminRouter = Router();
 adminRouter.use(authMiddleware);
@@ -23,17 +26,31 @@ const AuditLogQuerySchema = z.object({
   action: z.string().optional(),
   from: z.string().datetime({ offset: true }).optional(),
   to: z.string().datetime({ offset: true }).optional(),
+  search: z.string().optional(),
+  format: z.enum(['json', 'csv']).optional(),
+  export: z.enum(['json', 'csv']).optional(),
   page: z.coerce.number().int().min(1).default(1),
-  per_page: z.coerce.number().int().min(1).max(200).default(50),
+  per_page: z.coerce.number().int().min(1).max(1000).default(50),
 });
 
 adminRouter.get('/audit-log', requireRole('surety_admin'), async (req: Request, res: Response) => {
   const parse = AuditLogQuerySchema.safeParse(req.query);
   if (!parse.success) {
-    res.status(400).json({ error: 'invalid query params', details: parse.error.issues });
+    res.status(400).json({ error: 'invalid input', target: 'query', details: parse.error.issues });
     return;
   }
-  const { actor_user_id, action, from, to, page, per_page } = parse.data;
+  const {
+    actor_user_id,
+    action,
+    from,
+    to,
+    search,
+    format,
+    export: exportParam,
+    page,
+    per_page,
+  } = parse.data;
+  const isCsv = format === 'csv' || exportParam === 'csv' || req.headers.accept === 'text/csv';
   const offset = (page - 1) * per_page;
 
   const conditions: string[] = [];
@@ -41,34 +58,94 @@ adminRouter.get('/audit-log', requireRole('surety_admin'), async (req: Request, 
 
   if (actor_user_id) {
     params.push(actor_user_id);
-    conditions.push(`actor_user_id = $${params.length}`);
+    conditions.push(`al.actor_user_id = $${params.length}`);
   }
   if (action) {
     params.push(action);
-    conditions.push(`action = $${params.length}`);
+    conditions.push(`al.action = $${params.length}`);
   }
   if (from) {
     params.push(from);
-    conditions.push(`created_at >= $${params.length}`);
+    conditions.push(`al.created_at >= $${params.length}`);
   }
   if (to) {
     params.push(to);
-    conditions.push(`created_at <= $${params.length}`);
+    conditions.push(`al.created_at <= $${params.length}`);
+  }
+  if (search && search.trim().length > 0) {
+    params.push(`%${search.trim()}%`);
+    conditions.push(
+      `(al.action ILIKE $${params.length} OR al.payload::text ILIKE $${params.length} OR u.email ILIKE $${params.length} OR al.target_id::text ILIKE $${params.length})`
+    );
   }
 
   const where = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
 
+  if (isCsv) {
+    // Export all matching rows for CSV
+    const csvResult = await pool.query(
+      `SELECT al.id, al.actor_user_id, u.email AS actor_email, al.action, al.target_id, al.payload, al.created_at
+         FROM audit_log al
+         LEFT JOIN users u ON u.id = al.actor_user_id
+         ${where}
+         ORDER BY al.created_at DESC
+         LIMIT 5000`,
+      params
+    );
+
+    const escapeCsv = (val: unknown): string => {
+      if (val === null || val === undefined) return '';
+      const str = typeof val === 'object' ? JSON.stringify(val) : String(val);
+      if (str.includes(',') || str.includes('"') || str.includes('\n') || str.includes('\r')) {
+        return `"${str.replace(/"/g, '""')}"`;
+      }
+      return str;
+    };
+
+    const header = [
+      'id',
+      'timestamp',
+      'actor_email',
+      'actor_user_id',
+      'action',
+      'target_id',
+      'payload',
+    ];
+    const rows = csvResult.rows.map((row) =>
+      [
+        escapeCsv(row.id),
+        escapeCsv((row.created_at as Date).toISOString()),
+        escapeCsv(row.actor_email),
+        escapeCsv(row.actor_user_id),
+        escapeCsv(row.action),
+        escapeCsv(row.target_id),
+        escapeCsv(row.payload),
+      ].join(',')
+    );
+
+    const csvContent = [header.join(','), ...rows].join('\r\n');
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+    res.setHeader('Content-Disposition', 'attachment; filename="audit-log-export.csv"');
+    res.status(200).send(csvContent);
+    return;
+  }
+
   const countResult = await pool.query<{ count: string }>(
-    `SELECT COUNT(*) AS count FROM audit_log ${where}`,
+    `SELECT COUNT(*) AS count
+       FROM audit_log al
+       LEFT JOIN users u ON u.id = al.actor_user_id
+       ${where}`,
     params
   );
   const total = parseInt(countResult.rows[0]?.count ?? '0', 10);
 
   params.push(per_page, offset);
   const dataResult = await pool.query(
-    `SELECT id, actor_user_id, action, target_id, payload, created_at
-       FROM audit_log ${where}
-       ORDER BY created_at DESC
+    `SELECT al.id, al.actor_user_id, u.email AS actor_email, al.action, al.target_id, al.payload, al.created_at
+       FROM audit_log al
+       LEFT JOIN users u ON u.id = al.actor_user_id
+       ${where}
+       ORDER BY al.created_at DESC
        LIMIT $${params.length - 1} OFFSET $${params.length}`,
     params
   );
@@ -160,7 +237,7 @@ adminRouter.post(
       .safeParse(req.body);
 
     if (!parse.success) {
-      res.status(400).json({ error: 'invalid input', details: parse.error.issues });
+      res.status(400).json({ error: 'invalid input', target: 'body', details: parse.error.issues });
       return;
     }
     const { versionId, effectiveDate, changeSummary, policyText, requiresReacceptance } =
@@ -224,7 +301,7 @@ adminRouter.post(
       .safeParse(req.body);
 
     if (!parse.success) {
-      res.status(400).json({ error: 'invalid input', details: parse.error.issues });
+      res.status(400).json({ error: 'invalid input', target: 'body', details: parse.error.issues });
       return;
     }
 
@@ -269,7 +346,7 @@ adminRouter.get(
   async (req: Request, res: Response) => {
     const parse = OracleFeedQuerySchema.safeParse(req.query);
     if (!parse.success) {
-      res.status(400).json({ error: 'invalid query params', details: parse.error.issues });
+      res.status(400).json({ error: 'invalid input', target: 'query', details: parse.error.issues });
       return;
     }
     const { importer_id, from, to, page, per_page } = parse.data;
@@ -345,7 +422,7 @@ adminRouter.get(
     const filterSchema = OracleFeedQuerySchema.omit({ page: true, per_page: true });
     const parse = filterSchema.safeParse(req.query);
     if (!parse.success) {
-      res.status(400).json({ error: 'invalid query params', details: parse.error.issues });
+      res.status(400).json({ error: 'invalid input', target: 'query', details: parse.error.issues });
       return;
     }
     const { importer_id, from, to } = parse.data;
@@ -487,7 +564,7 @@ adminRouter.post(
   async (req: Request, res: Response) => {
     const parse = BatchAutoTopUpSchema.safeParse(req.body ?? {});
     if (!parse.success) {
-      res.status(400).json({ error: 'invalid input', details: parse.error.issues });
+      res.status(400).json({ error: 'invalid input', target: 'body', details: parse.error.issues });
       return;
     }
     const { importer_ids } = parse.data;
@@ -558,3 +635,534 @@ adminRouter.post(
     res.json({ succeeded, failed: errors.length, errors });
   }
 );
+
+// ── #1007: Importer credit-line pre-approvals ───────────────────────────────
+//
+// surety_admin grants a time-boxed credit line that temporarily covers a
+// collateral shortfall off-chain. Expiry is enforced by the hourly
+// credit-line monitor job (jobs/credit-line-monitor.ts); after expiry the
+// health check reverts to the strict requirement automatically.
+
+const GrantCreditLineSchema = z
+  .object({
+    importerId: z.string().uuid(),
+    // Stroops (integer string), matching the conventions used by deposits.
+    amount: z
+      .string()
+      .regex(/^\d+$/, 'amount must be an integer string of stroops')
+      .refine((v) => BigInt(v) > 0n, { message: 'amount must be positive' }),
+    expiresAt: z.string().datetime({ offset: true }).optional(),
+    durationHours: z.number().int().min(1).max(24 * 365).optional(),
+    reason: z.string().min(1).max(500).optional(),
+  })
+  .refine((d) => d.expiresAt || d.durationHours, {
+    message: 'either expiresAt or durationHours is required',
+  });
+
+adminRouter.post('/credit-lines', requireRole('surety_admin'), async (req: Request, res: Response) => {
+  const user = (req as AuthedRequest).user;
+  const parse = GrantCreditLineSchema.safeParse(req.body ?? {});
+  if (!parse.success) {
+    res.status(400).json({ error: 'invalid input', target: 'body', details: parse.error.issues });
+    return;
+  }
+  const { importerId, amount, expiresAt, durationHours, reason } = parse.data;
+
+  const importer = await pool.query(
+    'SELECT id, user_id, legal_name FROM importers WHERE id = $1 AND deleted_at IS NULL',
+    [importerId]
+  );
+  if (!importer.rowCount) {
+    res.status(404).json({ error: 'importer not found' });
+    return;
+  }
+
+  const now = Date.now();
+  let expiryMs: number;
+  if (expiresAt) {
+    expiryMs = new Date(expiresAt).getTime();
+    if (expiryMs <= now + 60_000) {
+      res.status(400).json({ error: 'expiresAt must be in the future' });
+      return;
+    }
+  } else {
+    expiryMs = now + (durationHours ?? 168) * 60 * 60 * 1000;
+  }
+
+  const inserted = await pool.query(
+    `INSERT INTO credit_lines (importer_id, granted_by, amount, reason, expires_at)
+     VALUES ($1, $2, $3, $4, $5)
+     RETURNING id, importer_id, granted_by, amount::text AS amount, reason, status,
+               granted_at, expires_at, revoked_at, revoked_by, notified_expiring, created_at`,
+    [importerId, user.id, amount, reason ?? null, new Date(expiryMs)]
+  );
+  const creditLine = inserted.rows[0];
+
+  await logAudit(user.id, 'credit_line_granted', creditLine.id, {
+    importerId,
+    amount,
+    expiresAt: creditLine.expires_at,
+    reason: reason ?? null,
+  });
+
+  // Tell the importer their shortfall is temporarily covered (#1007 AC).
+  const userId: string | null = importer.rows[0].user_id ?? null;
+  if (userId) {
+    await createNotification(
+      userId,
+      NOTIFICATION_KINDS.CREDIT_LINE_GRANTED,
+      `A credit line of ${amount} stroops was granted to your account until ${new Date(creditLine.expires_at).toISOString()}. Deposit collateral before it expires to keep permanent coverage.`
+    ).catch(() => undefined);
+  }
+
+  res.status(201).json({ creditLine });
+});
+
+const ListCreditLinesQuerySchema = z.object({
+  importer_id: z.string().uuid().optional(),
+  status: z.enum(['active', 'expired', 'revoked']).optional(),
+});
+
+adminRouter.get('/credit-lines', requireRole('surety_admin'), async (req: Request, res: Response) => {
+  const parse = ListCreditLinesQuerySchema.safeParse(req.query ?? {});
+  if (!parse.success) {
+    res.status(400).json({ error: 'invalid input', target: 'query', details: parse.error.issues });
+    return;
+  }
+
+  const conditions: string[] = [];
+  const params: unknown[] = [];
+  if (parse.data.importer_id) {
+    params.push(parse.data.importer_id);
+    conditions.push(`cl.importer_id = $${params.length}`);
+  }
+  if (parse.data.status) {
+    params.push(parse.data.status);
+    conditions.push(`cl.status = $${params.length}`);
+  }
+  const where = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
+
+  const result = await pool.query(
+    `SELECT cl.id, cl.importer_id, i.legal_name AS importer_legal_name, cl.granted_by,
+            cl.amount::text AS amount, cl.reason, cl.status, cl.granted_at, cl.expires_at,
+            cl.revoked_at, cl.revoked_by, cl.notified_expiring, cl.created_at
+     FROM credit_lines cl
+     JOIN importers i ON i.id = cl.importer_id
+     ${where}
+     ORDER BY cl.created_at DESC
+     LIMIT 500`,
+    params
+  );
+  res.json({ creditLines: result.rows });
+});
+
+adminRouter.post(
+  '/credit-lines/:id/revoke',
+  requireRole('surety_admin'),
+  async (req: Request, res: Response) => {
+    const user = (req as AuthedRequest).user;
+    const parse = z.object({ reason: z.string().max(500).optional() }).safeParse(req.body ?? {});
+    if (!parse.success) {
+      res.status(400).json({ error: 'invalid input', target: 'body', details: parse.error.issues });
+      return;
+    }
+
+    const result = await pool.query(
+      `UPDATE credit_lines
+          SET status = 'revoked', revoked_at = now(), revoked_by = $1
+        WHERE id = $2 AND status = 'active'
+        RETURNING id, importer_id, granted_by, amount::text AS amount, reason, status,
+                  granted_at, expires_at, revoked_at, revoked_by, notified_expiring, created_at`,
+      [user.id, req.params.id]
+    );
+    if (!result.rowCount) {
+      res.status(404).json({ error: 'active credit line not found' });
+      return;
+    }
+    const creditLine = result.rows[0];
+
+    await logAudit(user.id, 'credit_line_revoked', creditLine.id, {
+      importerId: creditLine.importer_id,
+      amount: creditLine.amount,
+      reason: parse.data.reason ?? null,
+    });
+
+    res.json({ creditLine });
+  }
+);
+
+// ── #1008: Dispute resolution recommendation + admin resolution ─────────────
+//
+// GET returns an advisory suggestion only; POST performs the actual
+// resolve_dispute decision (never auto-triggered — see
+// docs/dispute-recommendation.md).
+
+adminRouter.get(
+  '/disputes',
+  requireRole('surety_admin'),
+  async (_req: Request, res: Response) => {
+    const result = await pool.query(
+      `SELECT cd.id, cd.importer_id, i.legal_name AS importer_legal_name, i.stellar_address,
+              cd.old_required::text AS old_required, cd.new_required::text AS new_required,
+              cd.raise_tx_hash, cd.status, cd.raised_at, cd.resolved_at, cd.resolve_tx_hash
+       FROM collateral_disputes cd
+       JOIN importers i ON i.id = cd.importer_id
+       WHERE cd.status = 'open'
+       ORDER BY cd.raised_at DESC`
+    );
+
+    // #992: Surface evidence list to surety_admin before calling resolve_dispute
+    const disputeIds = result.rows.map((d) => d.id);
+    const evidenceByDispute = new Map<string, any[]>();
+    if (disputeIds.length > 0) {
+      const evResult = await pool.query(
+        `SELECT id, dispute_id, importer_id, file_name, mime_type, file_size_bytes,
+                s3_key_encrypted, virus_scan_status, notes, created_at
+         FROM dispute_evidence
+         WHERE dispute_id = ANY($1::uuid[])
+         ORDER BY created_at ASC`,
+        [disputeIds]
+      );
+      for (const ev of evResult.rows) {
+        const list = evidenceByDispute.get(ev.dispute_id) ?? [];
+        list.push({
+          id: ev.id,
+          disputeId: ev.dispute_id,
+          importerId: ev.importer_id,
+          fileName: ev.file_name,
+          mimeType: ev.mime_type,
+          fileSizeBytes: ev.file_size_bytes,
+          virusScanStatus: ev.virus_scan_status,
+          notes: ev.notes,
+          createdAt: ev.created_at,
+          downloadUrl: ev.s3_key_encrypted
+            ? generatePresignedUrl(s3KeyDecrypt(ev.s3_key_encrypted))
+            : null,
+        });
+        evidenceByDispute.set(ev.dispute_id, list);
+      }
+    }
+
+    const disputes = result.rows.map((d) => ({
+      ...d,
+      evidence: evidenceByDispute.get(d.id) ?? [],
+    }));
+
+    res.json({ disputes });
+  }
+);
+
+// GET /disputes/:id/evidence — surety_admin views evidence for a specific dispute before resolving (#992)
+adminRouter.get(
+  '/disputes/:id/evidence',
+  requireRole('surety_admin'),
+  async (req: Request, res: Response) => {
+    const disputeId = String(req.params.id ?? '');
+    const dispute = await pool.query(
+      `SELECT cd.id, cd.importer_id, cd.status, i.legal_name, i.stellar_address
+       FROM collateral_disputes cd
+       JOIN importers i ON i.id = cd.importer_id
+       WHERE cd.id = $1`,
+      [disputeId]
+    );
+    if (!dispute.rowCount) {
+      res.status(404).json({ error: 'dispute not found' });
+      return;
+    }
+    const evidenceRes = await pool.query(
+      `SELECT id, dispute_id, importer_id, file_name, mime_type, file_size_bytes,
+              s3_key_encrypted, virus_scan_status, notes, created_at
+       FROM dispute_evidence
+       WHERE dispute_id = $1
+       ORDER BY created_at ASC`,
+      [disputeId]
+    );
+    const evidence = evidenceRes.rows.map((row) => ({
+      id: row.id,
+      disputeId: row.dispute_id,
+      importerId: row.importer_id,
+      fileName: row.file_name,
+      mimeType: row.mime_type,
+      fileSizeBytes: row.file_size_bytes,
+      virusScanStatus: row.virus_scan_status,
+      notes: row.notes,
+      createdAt: row.created_at,
+      downloadUrl: row.s3_key_encrypted
+        ? generatePresignedUrl(s3KeyDecrypt(row.s3_key_encrypted))
+        : null,
+    }));
+    res.json({ dispute: dispute.rows[0], evidence });
+  }
+);
+
+adminRouter.get(
+  '/disputes/:importerId/recommendation',
+  requireRole('surety_admin'),
+  async (req: Request, res: Response) => {
+    const importerId = String(req.params.importerId ?? '');
+    if (!z.string().uuid().safeParse(importerId).success) {
+      res.status(400).json({ error: 'invalid importer id' });
+      return;
+    }
+    const recommendation = await buildDisputeRecommendation(importerId);
+    if (!recommendation) {
+      res.status(404).json({ error: 'importer not found' });
+      return;
+    }
+    res.json({ recommendation });
+  }
+);
+
+const ResolveDisputeSchema = z.object({
+  accept: z.boolean(),
+  note: z.string().max(500).optional(),
+});
+
+adminRouter.post(
+  '/disputes/:id/resolve',
+  requireRole('surety_admin'),
+  async (req: Request, res: Response) => {
+    const user = (req as AuthedRequest).user;
+    const parse = ResolveDisputeSchema.safeParse(req.body ?? {});
+    if (!parse.success) {
+      res.status(400).json({ error: 'invalid input', target: 'body', details: parse.error.issues });
+      return;
+    }
+    const { accept, note } = parse.data;
+
+    const dispute = await pool.query(
+      `SELECT cd.id, cd.importer_id, cd.status, i.stellar_address, i.legal_name
+       FROM collateral_disputes cd
+       JOIN importers i ON i.id = cd.importer_id
+       WHERE cd.id = $1`,
+      [req.params.id]
+    );
+    if (!dispute.rowCount) {
+      res.status(404).json({ error: 'dispute not found' });
+      return;
+    }
+    if (dispute.rows[0].status !== 'open') {
+      res.status(409).json({ error: 'dispute is not open' });
+      return;
+    }
+
+    // Explicit admin decision — the recommendation is never applied here.
+    const onChain = await contractClient.resolveDispute(
+      platformKeypair,
+      dispute.rows[0].stellar_address,
+      accept
+    );
+
+    const newStatus = accept ? 'resolved_accepted' : 'resolved_rejected';
+    const updated = await pool.query(
+      `UPDATE collateral_disputes
+          SET status = $1, resolved_at = now(), resolve_tx_hash = $2
+        WHERE id = $3
+        RETURNING id, importer_id, old_required::text AS old_required,
+                  new_required::text AS new_required, status, raised_at, resolved_at,
+                  resolve_tx_hash`,
+      [newStatus, onChain.txHash, req.params.id]
+    );
+
+    await pool.query(
+      `INSERT INTO contract_events (importer_id, kind, tx_hash, raw)
+       VALUES ($1, 'dispute_resolved', $2, $3)
+       ON CONFLICT DO NOTHING`,
+      [
+        dispute.rows[0].importer_id,
+        onChain.txHash,
+        JSON.stringify({ accept, resolvedBy: user.id }),
+      ]
+    );
+
+    await logAudit(user.id, 'dispute_resolved', dispute.rows[0].id, {
+      importerId: dispute.rows[0].importer_id,
+      accept,
+      txHash: onChain.txHash,
+      txUrl: explorerTx(onChain.txHash),
+      note: note ?? null,
+    });
+
+    res.json({ dispute: updated.rows[0], txUrl: explorerTx(onChain.txHash) });
+  }
+);
+
+// ── #1018: Oracle Signer Rotation Workflow Endpoints ─────────────────────────
+
+const ProposeRotationSchema = z.object({
+  newSigners: z.array(z.string().length(56)).length(3),
+});
+
+// POST /admin/oracle-signers/propose — propose a new set of 3 oracle signers
+adminRouter.post('/oracle-signers/propose', requireRole('surety_admin'), async (req: Request, res: Response) => {
+  const user = (req as AuthedRequest).user;
+  const parse = ProposeRotationSchema.safeParse(req.body);
+  if (!parse.success) {
+    res.status(400).json({ error: 'invalid input', target: 'body', details: parse.error.issues });
+    return;
+  }
+  const { newSigners } = parse.data;
+
+  // Enforce distinct signers
+  if (new Set(newSigners).size !== 3) {
+    res.status(400).json({ error: 'new signers must be 3 distinct Stellar addresses' });
+    return;
+  }
+
+  try {
+    const inserted = await pool.query(
+      `INSERT INTO oracle_signer_rotations (proposed_by, new_signers, threshold, status)
+       VALUES ($1, $2, 2, 'pending_signatures')
+       RETURNING id, proposed_by, new_signers, threshold, approvals, status, created_at`,
+      [user.id, JSON.stringify(newSigners)]
+    );
+
+    await logAudit(user.id, 'oracle_signer_rotation_proposed', inserted.rows[0].id, { newSigners });
+
+    res.status(201).json({ proposal: inserted.rows[0] });
+  } catch (err: any) {
+    console.error('[admin] failed to propose oracle signer rotation:', err);
+    res.status(500).json({ error: 'failed to create signer rotation proposal' });
+  }
+});
+
+// GET /admin/oracle-signers/active — get active proposal and on-chain signers
+adminRouter.get('/oracle-signers/active', requireRole('surety_admin'), async (_req: Request, res: Response) => {
+  try {
+    const proposalRes = await pool.query(
+      `SELECT id, proposed_by, new_signers, threshold, approvals, status, created_at
+       FROM oracle_signer_rotations
+       WHERE status = 'pending_signatures'
+       ORDER BY created_at DESC LIMIT 1`
+    );
+
+    let onChainSigners: string[] = [];
+    try {
+      onChainSigners = await contractClient.getOracleSigners();
+    } catch {
+      // Fallback if contract client mock/network is unavailable
+      onChainSigners = [];
+    }
+
+    res.json({
+      activeProposal: proposalRes.rows[0] ?? null,
+      onChainSigners,
+    });
+  } catch (err: any) {
+    console.error('[admin] failed to fetch active oracle signer rotation:', err);
+    res.status(500).json({ error: 'failed to fetch active rotation proposal' });
+  }
+});
+
+// POST /admin/oracle-signers/:id/approve — add approval to proposal
+adminRouter.post('/oracle-signers/:id/approve', requireRole('surety_admin'), async (req: Request, res: Response) => {
+  const user = (req as AuthedRequest).user;
+  const proposalId = req.params.id;
+
+  try {
+    const proposalRes = await pool.query(
+      `SELECT id, approvals, threshold, status FROM oracle_signer_rotations WHERE id = $1 AND status = 'pending_signatures'`,
+      [proposalId]
+    );
+
+    if (!proposalRes.rowCount) {
+      res.status(404).json({ error: 'active proposal not found' });
+      return;
+    }
+
+    const proposal = proposalRes.rows[0];
+    const approvals: Array<{ approverId: string; approvedAt: string }> = proposal.approvals || [];
+
+    if (approvals.some((a) => a.approverId === user.id)) {
+      res.status(409).json({ error: 'you have already approved this proposal' });
+      return;
+    }
+
+    approvals.push({ approverId: user.id, approvedAt: new Date().toISOString() });
+
+    const updated = await pool.query(
+      `UPDATE oracle_signer_rotations SET approvals = $1 WHERE id = $2 RETURNING id, new_signers, threshold, approvals, status`,
+      [JSON.stringify(approvals), proposalId]
+    );
+
+    await logAudit(user.id, 'oracle_signer_rotation_approved', proposalId, { approvalCount: approvals.length });
+
+    res.json({ proposal: updated.rows[0] });
+  } catch (err: any) {
+    console.error('[admin] failed to approve oracle signer rotation:', err);
+    res.status(500).json({ error: 'failed to submit approval' });
+  }
+});
+
+// POST /admin/oracle-signers/:id/execute — execute signer rotation on-chain
+adminRouter.post('/oracle-signers/:id/execute', requireRole('surety_admin'), async (req: Request, res: Response) => {
+  const user = (req as AuthedRequest).user;
+  const proposalId = req.params.id;
+
+  try {
+    const proposalRes = await pool.query(
+      `SELECT id, new_signers, threshold, approvals, status FROM oracle_signer_rotations WHERE id = $1 AND status = 'pending_signatures'`,
+      [proposalId]
+    );
+
+    if (!proposalRes.rowCount) {
+      res.status(404).json({ error: 'active proposal not found' });
+      return;
+    }
+
+    const proposal = proposalRes.rows[0];
+    const approvals = proposal.approvals || [];
+
+    if (approvals.length < proposal.threshold) {
+      res.status(400).json({ error: `insufficient approvals: need ${proposal.threshold}, got ${approvals.length}` });
+      return;
+    }
+
+    const newSigners: string[] = typeof proposal.new_signers === 'string' ? JSON.parse(proposal.new_signers) : proposal.new_signers;
+
+    const onChain = await contractClient.updateOracleSigners(
+      platformKeypair,
+      newSigners,
+      [platformKeypair.publicKey(), oracleKeypair.publicKey()]
+    );
+
+    const updated = await pool.query(
+      `UPDATE oracle_signer_rotations
+       SET status = 'executed', tx_hash = $1, executed_at = NOW()
+       WHERE id = $2
+       RETURNING id, new_signers, status, tx_hash, executed_at`,
+      [onChain.txHash, proposalId]
+    );
+
+    await logAudit(user.id, 'oracle_signer_rotation_executed', proposalId, {
+      txHash: onChain.txHash,
+      newSigners,
+    });
+
+    res.json({
+      proposal: updated.rows[0],
+      txUrl: explorerTx(onChain.txHash),
+    });
+  } catch (err: any) {
+    console.error('[admin] failed to execute oracle signer rotation:', err);
+    res.status(500).json({ error: 'failed to execute signer rotation on-chain' });
+  }
+});
+
+// GET /admin/oracle-signers/history — rotation audit history
+adminRouter.get('/oracle-signers/history', requireRole('surety_admin'), async (_req: Request, res: Response) => {
+  try {
+    const historyRes = await pool.query(
+      `SELECT r.id, r.proposed_by, u.email AS proposed_by_email, r.new_signers, r.threshold, r.approvals, r.status, r.tx_hash, r.created_at, r.executed_at
+       FROM oracle_signer_rotations r
+       LEFT JOIN users u ON u.id = r.proposed_by
+       ORDER BY r.created_at DESC LIMIT 50`
+    );
+
+    res.json({ history: historyRes.rows });
+  } catch (err: any) {
+    console.error('[admin] failed to fetch oracle signer rotation history:', err);
+    res.status(500).json({ error: 'failed to fetch rotation history' });
+  }
+});
+

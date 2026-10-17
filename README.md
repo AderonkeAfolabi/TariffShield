@@ -85,6 +85,40 @@ docker-compose up --build
 
 For hot-reload during development, `docker-compose.override.yml` mounts source directories automatically — no `--build` needed after editing TypeScript.
 
+### Which services are Dockerized vs host-only
+
+| Service | Dockerized? | Notes |
+|---|---|---|
+| Postgres | Yes | `docker-compose.yml`, port 5443 |
+| Redis | Yes | `docker-compose.yml`, port 6379 |
+| API (`apps/api`) | Yes, with hot reload | `docker-compose.override.yml` mounts `apps/api/src` and runs `tsx watch` |
+| Web (`apps/web`) | Yes, with hot reload | `docker-compose.override.yml` mounts `apps/web/src`, `app`, `components`, `lib` |
+| Jaeger tracing UI | Yes | `docker-compose.yml`, port 16686 |
+| Contract dev (`contracts/tariff-shield`) | **Optional** — host by default | See below |
+
+**Contract hot-reload (`npm run watch:contracts`) runs on the host by
+default, not inside `docker-compose up`.** It requires Rust and
+`cargo-watch` installed locally (`cargo install cargo-watch --version
+8.5.2`) even if you're otherwise running the full-stack Docker flow above —
+`docker-compose up` alone does not build or watch the contract, since
+Postgres/API/Web don't depend on it at runtime.
+
+If you'd rather not install Rust on the host, `docker-compose.override.yml`
+also ships an optional, opt-in `contracts` service that runs `cargo watch`
+inside a Rust container, mounting `contracts/` for hot reload the same way
+`api`/`web` do for TypeScript:
+
+```bash
+docker-compose --profile contracts up contracts
+```
+
+It's excluded from the default `docker-compose up` (via a Compose
+`profiles` gate) because most sessions working on `apps/api`/`apps/web`
+don't need it running, and the first `cargo watch -x test` inside a cold
+container has to fetch the crate registry, which is slow the first time.
+Production `docker-compose.yml` is unaffected either way — this service
+only exists in the local-dev override file.
+
 ## Quick start with Dev Containers
 
 The easiest way to get started is using GitHub Codespaces or the VS Code Dev Containers extension. The environment is pre-configured with Node.js, Rust, Docker, and the Soroban CLI.
@@ -127,15 +161,21 @@ Open http://localhost:3000.
 The pre-deployed contract works out of the box — your `.env.example` already points at `CBLASRVG7NRAFP2CDPVSF4WTJBKC6L4FKT2XHR3OH7CLICUBPVQ4PBBF`. To deploy your own:
 
 ```bash
+# Generate and fund a key (one-time)
 stellar keys generate --fund my-admin --network testnet
-stellar contract deploy \
-  --network testnet \
-  --source-account my-admin \
-  --wasm target/wasm32-unknown-unknown/release/tariff_shield.optimized.wasm
-# then `stellar contract invoke <C…> -- initialize --admin <G…> --surety <G…> --token <SAC…>`
+
+# Build the contract first
+npm run contract:build
+
+# Deploy + initialize in one step (defaults: --network testnet --source my-admin)
+npm run contract:deploy -- \
+  --surety <SURETY_PUBLIC_KEY> \
+  --token <TOKEN_CONTRACT_ID>
 ```
 
-Replace `TARIFF_SHIELD_CONTRACT_ID` in your `.env`.
+The script prints the new contract ID at the end — replace `TARIFF_SHIELD_CONTRACT_ID` in your `.env` with it.
+
+You can also pass `--network`, `--source`, `--wasm`, and `--admin` flags, or use `--skip-init` to deploy the wasm without running `initialize`. Run `npx tsx scripts/deploy-contracts.ts --help` for the full option list.
 
 ## Verification flow
 
@@ -190,16 +230,22 @@ Running into a setup or runtime error? Check **[docs/FAQ.md](./docs/FAQ.md)** fo
 
 ## API Documentation
 
-The REST API ships with an OpenAPI 3.1 specification and an interactive Swagger UI:
+The REST API provides a machine-readable OpenAPI specification for SDK consumers and third-party integrators:
 
+- [docs/api/openapi.yml](./docs/api/openapi.yml) — The source of truth OpenAPI 3.x specification.
+
+To view the interactive Swagger UI and explore the API locally:
+
+1. Start the API server: `npm run dev:api`
+2. Open [http://localhost:3002/docs](http://localhost:3002/docs) in your browser.
+
+The API also serves the spec at runtime:
 | Endpoint | Description |
 |---|---|
 | `GET /docs` | Swagger UI (rendered in browser) |
-| `GET /docs/openapi.json` | Raw OpenAPI 3.1 spec (JSON) |
+| `GET /docs/openapi.json` | Raw OpenAPI spec (JSON) |
 
-Start the API (`npm run dev:api`) then open [http://localhost:3002/docs](http://localhost:3002/docs).
-
-The spec covers all 30+ routes across Auth, Importers, KYC, Compliance, Surety License, and Health, with request/response schemas and JWT security requirements on each protected route.
+The spec covers all 30+ routes across Auth, Importers, KYC, Compliance, Surety License, and Health, with request/response schemas and JWT security requirements on each protected route. To regenerate or update the spec, simply edit the `docs/api/openapi.yml` file.
 
 ## Code Style
 
@@ -235,6 +281,12 @@ npm run watch:contracts
 make watch-contracts
 ```
 The watch process is scoped to `src/` (`-w src/`) to avoid rebuild loops triggered by `target/` output.
+
+This is a host-only workflow, separate from the `docker-compose up` full-stack
+flow described above — see [Which services are Dockerized vs
+host-only](#which-services-are-dockerized-vs-host-only) for the fully-dockerized
+alternative (`docker-compose --profile contracts up contracts`) if you'd
+rather not install Rust locally.
 
 ### Pre-commit Hooks
 Pre-commit checks are managed with `husky` and `lint-staged`. On `git commit`:

@@ -9,6 +9,7 @@ import {
   tosReacceptanceGate,
   type AuthedRequest,
 } from '../auth.js';
+import { getReportTemplate, type ReportTemplate } from './report-templates.js';
 
 const logger = pino({ name: 'regulatory-report' });
 
@@ -96,6 +97,12 @@ regulatoryRouter.get('/state-report/:state_code', async (req: Request, res: Resp
     return;
   }
 
+  // #1032: branded export template (logo/header/footer) for this surety, applied
+  // to the underlying report data below — fetched fresh on every request (not
+  // cached alongside the report data) so a template edit is reflected
+  // immediately even while the report cache entry is still warm.
+  const template = await getReportTemplate(user.id);
+
   // 3. Cache lookup
   const cacheKey = `${stateCode}:${user.id}:${startDate.getTime()}:${endDate.getTime()}:${format}`;
   const cachedData = getCached(cacheKey);
@@ -108,21 +115,25 @@ regulatoryRouter.get('/state-report/:state_code', async (req: Request, res: Resp
         'Content-Disposition',
         `attachment; filename="regulatory_report_${stateCode}.csv"`
       );
-      res.send(cachedData);
+      res.send(applyCsvTemplate(cachedData, template));
     } else {
-      res.json(cachedData);
+      res.json({ ...cachedData, reportTemplate: template });
     }
     return;
   }
 
   // 4. Data aggregation queries covering the reporting period:
+  // #1024: Exclude sandbox/trial importer accounts & bonds from regulatory report queries
   // a) Total bonds written and aggregate face value in target state
   const bondsQuery = await pool.query<{ total_bonds: string; aggregate_face_value: string }>(
     `SELECT COUNT(*)::text as total_bonds, COALESCE(SUM(bond_amount), 0)::text as aggregate_face_value
-     FROM bond_records
-     WHERE state_code = $1
-       AND effective_date >= $2
-       AND effective_date <= $3`,
+     FROM bond_records br
+     JOIN importers i ON br.importer_id = i.id
+     WHERE br.state_code = $1
+       AND br.effective_date >= $2
+       AND br.effective_date <= $3
+       AND COALESCE(i.is_sandbox, false) = false
+       AND COALESCE(br.is_sandbox, false) = false`,
     [stateCode, startDate, endDate]
   );
 
@@ -138,7 +149,9 @@ regulatoryRouter.get('/state-report/:state_code', async (req: Request, res: Resp
      WHERE ce.kind = 'clawback'
        AND br.state_code = $1
        AND ce.created_at >= $2
-       AND ce.created_at <= $3`,
+       AND ce.created_at <= $3
+       AND COALESCE(i.is_sandbox, false) = false
+       AND COALESCE(br.is_sandbox, false) = false`,
     [stateCode, startDate, endDate]
   );
   const claimsFiled = parseInt(claimsQuery.rows[0]?.claims_count ?? '0', 10);
@@ -150,7 +163,9 @@ regulatoryRouter.get('/state-report/:state_code', async (req: Request, res: Resp
      JOIN bond_records br ON br.importer_id = i.id
      WHERE br.state_code = $1
        AND br.effective_date >= $2
-       AND br.effective_date <= $3`,
+       AND br.effective_date <= $3
+       AND COALESCE(i.is_sandbox, false) = false
+       AND COALESCE(br.is_sandbox, false) = false`,
     [stateCode, startDate, endDate]
   );
   const collateralHeld = collateralQuery.rows[0]?.collateral_held ?? '0';
@@ -163,6 +178,8 @@ regulatoryRouter.get('/state-report/:state_code', async (req: Request, res: Resp
      WHERE br.state_code = $1
        AND br.effective_date >= $2
        AND br.effective_date <= $3
+       AND COALESCE(i.is_sandbox, false) = false
+       AND COALESCE(br.is_sandbox, false) = false
      GROUP BY COALESCE(i.business_state, 'UNKNOWN')`,
     [stateCode, startDate, endDate]
   );
@@ -230,7 +247,7 @@ regulatoryRouter.get('/state-report/:state_code', async (req: Request, res: Resp
     'Compliance report generated for regulator'
   );
 
-  // 7. Write to cache and send response
+  // 7. Write to cache (raw, un-templated) and send response
   setCache(cacheKey, responseData);
   res.setHeader('X-Cache', 'MISS');
 
@@ -240,8 +257,21 @@ regulatoryRouter.get('/state-report/:state_code', async (req: Request, res: Resp
       'Content-Disposition',
       `attachment; filename="regulatory_report_${stateCode}.csv"`
     );
-    res.send(responseData);
+    res.send(applyCsvTemplate(responseData, template));
   } else {
-    res.json(responseData);
+    res.json({ ...responseData, reportTemplate: template });
   }
 });
+
+// #1032: wraps the CSV data rows with the tenant's configured header/footer
+// text as leading/trailing comment lines. The data rows themselves — and
+// their column order — are untouched, so this is safe for automated CSV
+// ingestion that skips '#'-prefixed lines and purely cosmetic for a human
+// opening the file directly.
+function applyCsvTemplate(csvData: string, template: ReportTemplate): string {
+  const lines: string[] = [];
+  if (template.headerText) lines.push(`# ${template.headerText}`);
+  lines.push(csvData.trimEnd());
+  if (template.footerText) lines.push(`# ${template.footerText}`);
+  return lines.join('\r\n') + '\r\n';
+}

@@ -44,6 +44,9 @@ npm run dev:web      # Web on :3000
 
 # 8. Verify the API is up
 curl -f http://localhost:3002/health   # should return 200
+
+# 9. (Optional) run the happy-path e2e smoke check
+npm run e2e                            # exercises signup → register → deposit → top-up
 ```
 
 See [docs/local-dev.md](docs/local-dev.md) for troubleshooting local environment issues.
@@ -52,7 +55,7 @@ See [docs/local-dev.md](docs/local-dev.md) for troubleshooting local environment
 
 - **TypeScript** (`apps/api`, `apps/web`, `packages/sdk`): `strict` mode is enabled in every `tsconfig.json` — do not disable it or add `any` to work around a type error. Follow the existing import order (external packages, then internal `@tariffshield/*` / relative imports). Run before pushing:
   ```bash
-  npm run typecheck --workspace=apps/web
+  npm run typecheck                      # runs typecheck in every workspace that defines it
   npm run lint --workspace=apps/api      # eslint --max-warnings 0
   npm run lint --workspace=apps/web
   npm run format:check --workspace=apps/api
@@ -103,10 +106,21 @@ The watch command uses `-w src/` to watch crate source files only, avoiding buil
 |-------|---------|
 | Contract unit tests | `cargo test --workspace` (or `npm run contract:test`) |
 | API integration tests | `npm run test:integration --workspace=apps/api` |
-| SDK tests | `packages/sdk` has no dedicated test script yet — type-check it with `npm run build --workspace=packages/sdk` and exercise it via the API integration tests, which run against the real SDK client |
+| SDK tests | `npm run test --workspace=packages/sdk` (runs `src/compatibility.test.ts` via `tsx --test`) |
+| Happy-path e2e smoke | `npm run e2e` — start the API first (`npm run dev:api`), then run from the repo root. Exits non-zero on any step failure. |
 | End-to-end tests | `npx playwright test` (from `apps/web`; see `apps/web/package.json` `test:e2e`) |
 
 CI runs the contract, typecheck, and lint suites on every PR — see `.github/workflows/ci.yml` and `.github/workflows/contract.yml`.
+
+### Regenerating API types
+
+`packages/api-types/index.ts` is generated from `docs/security/openapi.yaml` by `openapi-typescript`. Re-run the generator whenever you change the OpenAPI spec:
+
+```bash
+npm run generate:types   # from the repo root
+```
+
+Commit the updated `packages/api-types/index.ts` alongside any spec change. Reviewers should flag PRs that modify `docs/security/openapi.yaml` without a corresponding update to the generated types file.
 
 ---
 

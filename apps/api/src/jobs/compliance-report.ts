@@ -1,11 +1,12 @@
 import { pool } from '../db.js';
 import { env } from '../config/env.js';
+import { logger } from '../lib/logger.js';
 
 // Monthly compliance report generation job (#319).
 // Scheduled to run on the first business day of each month.
 // Re-running for the same month overwrites the draft and marks the previous version superseded.
 
-interface ReportData {
+export interface ReportData {
   month: string; // YYYY-MM
   bondPortfolio: {
     totalActive: number;
@@ -31,7 +32,7 @@ interface ReportData {
   };
 }
 
-async function buildReportData(monthStart: Date, monthEnd: Date): Promise<ReportData> {
+export async function buildReportData(monthStart: Date, monthEnd: Date): Promise<ReportData> {
   const month = monthStart.toISOString().slice(0, 7);
 
   const [
@@ -134,20 +135,30 @@ async function buildReportData(monthStart: Date, monthEnd: Date): Promise<Report
 }
 
 // Stub: in production, render HTML via Puppeteer/PDFKit and upload to S3_REPORTS_BUCKET.
-async function generateAndUploadPdf(
+// `keyName` defaults to the report month; scheduled (#1013) reports pass a
+// schedule+period specific name so weekly reports don't overwrite each other.
+export async function generateAndUploadPdf(
   reportData: ReportData,
-  suretyId: string
+  suretyId: string,
+  keyName: string = reportData.month
 ): Promise<string | null> {
   if (!env.S3_REPORTS_BUCKET) return null;
-  const key = `reports/${suretyId}/${reportData.month}.pdf`;
+  const key = `reports/${suretyId}/${keyName}.pdf`;
   // Production: await puppeteer render + S3 PutObjectCommand with SSE-KMS
   return key;
+}
+
+export const REPORT_URL_EXPIRES_IN_SECONDS = 900;
+
+// Stub: in production, generate a pre-signed S3 GetObject URL for `key`.
+export function presignReportUrl(key: string): string {
+  return `/dev/reports/${key}`;
 }
 
 // Stub: in production, use SendGrid/SES to email surety_admin users.
 async function notifySuretyAdmins(suretyId: string, reportMonth: string): Promise<void> {
   if (!env.SENDGRID_API_KEY) {
-    console.log(`[compliance-report] would email surety ${suretyId} re: ${reportMonth} report`);
+    logger.info({ suretyId, reportMonth }, `[compliance-report] would email surety ${suretyId} re: ${reportMonth} report`);
     return;
   }
   // Production: fetch surety_admin emails, send via SendGrid
@@ -184,9 +195,9 @@ export async function generateMonthlyComplianceReport(targetMonth?: Date): Promi
       );
 
       await notifySuretyAdmins(suretyId, reportMonthDate);
-      console.log(`[compliance-report] generated ${reportMonthDate} report for surety ${suretyId}`);
+      logger.info({ suretyId, reportMonth: reportMonthDate }, `[compliance-report] Report execution: Generated ${reportMonthDate} for surety ${suretyId}`);
     } catch (err) {
-      console.error(`[compliance-report] failed for surety ${suretyId}:`, err);
+      logger.error({ suretyId, err }, `[compliance-report] Report execution failed for surety ${suretyId}`);
     }
   }
 }
@@ -209,16 +220,16 @@ export function startComplianceReportScheduler(): void {
   async function tick() {
     const now = new Date();
     if (now.getUTCHours() === 6 && isFirstBusinessDayOfMonth(now)) {
-      console.log('[compliance-report] triggering monthly report generation');
+      logger.info('[compliance-report] Scheduler: Triggering monthly report generation');
       await generateMonthlyComplianceReport(now).catch((err) =>
-        console.error('[compliance-report] scheduler error:', err)
+        logger.error({ err }, '[compliance-report] Scheduler error during report generation')
       );
     }
   }
 
   setInterval(() => {
-    tick().catch((err) => console.error('[compliance-report] tick error:', err));
+    tick().catch((err) => logger.error({ err }, '[compliance-report] Scheduler tick error'));
   }, CHECK_INTERVAL_MS);
 
-  console.log('[compliance-report] scheduler started');
+  logger.info('[compliance-report] Scheduler started');
 }

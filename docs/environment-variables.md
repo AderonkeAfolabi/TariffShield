@@ -1,8 +1,8 @@
 # Environment Variable Reference
 
-TariffShield is a monorepo. Each service (`apps/api`, `apps/web`) has its own `.env` file. Variables are **not** automatically shared between services — the API server and the Next.js frontend each read only their own environment.
+TariffShield is a monorepo. Each service (`apps/api`, `apps/web`) has its own environment file — the API reads `apps/api/.env` and the Next.js frontend reads `apps/web/.env.local`. Variables are **not** automatically shared between services — the API server and the Next.js frontend each read only their own environment.
 
-Copy the relevant `.env.example` file to `.env` in the same directory and fill in the values before starting each service.
+For local development, copy the relevant `.env.example` file to `.env` (API) or `.env.local` (web) in the same directory and fill in the values before starting each service. Next.js auto-loads `.env.local` on `npm run dev`/`npm run build` and it takes precedence over a plain `.env` (the onboarding paths `make setup-env`, `scripts/setup-env.ts`, and `docs/FAQ.md` all standardize on `apps/web/.env.local` for web-only overrides).
 
 ---
 
@@ -18,6 +18,7 @@ Source of truth for these descriptions is the Zod schema in `apps/api/src/config
 | `NODE_ENV` | No (default: `development`) | Application environment. Accepted: `development`, `production`, `test` | `development` |
 | `DATABASE_URL` | **Yes** | PostgreSQL connection string. Append `?sslmode=require` for managed databases | `postgres://tariffshield:secret@localhost:5443/tariffshield` |
 | `REDIS_URL` | No (default: `redis://localhost:6379`) | Redis connection string, shared by the BullMQ job queue (`queue.ts`) and the on-chain account state cache (`cache.ts`, #246) — caches `GET /importers/:id` Soroban RPC reads under key `onchain:importer:<id>` with a 30s TTL | `redis://localhost:6379` |
+| `TX_SUBMIT_WORKER_CONCURRENCY` | No (default: `8`) | Number of `tx-submit` jobs (`queue.ts`) the worker (`worker.ts`) processes concurrently — see `docs/investigations/deposit-collateral-throughput.md` (#1089) for why 8 and not BullMQ's default of 1 | `8` |
 | `FRONTEND_ORIGIN` | No (default: `http://localhost:3000`) | CORS allowed origin for the web frontend | `http://localhost:3000` |
 
 ### Authentication
@@ -85,7 +86,7 @@ All DocuSign variables are optional. If not set, bond-signature endpoints operat
 | `DOCUSIGN_ACCOUNT_ID` | No | DocuSign account ID | `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx` |
 | `DOCUSIGN_BASE_PATH` | No | DocuSign base API URL. Use demo URL for testing | `https://demo.docusign.net/restapi` |
 | `DOCUSIGN_PRIVATE_KEY` | No | RSA private key for DocuSign JWT grant (PEM format) | `-----BEGIN RSA PRIVATE KEY-----\n...` |
-| `DOCUSIGN_WEBHOOK_HMAC_KEY` | No | HMAC key for verifying DocuSign Connect webhook signatures | `random-64-char-secret` |
+| `DOCUSIGN_WEBHOOK_HMAC_KEY` | No | HMAC key for verifying DocuSign Connect webhook signatures (see [bond-signatures webhook docs](api/bond-signatures.md#signature-verification)) | `random-64-char-secret` |
 
 ### Field-Level Encryption
 
@@ -108,10 +109,13 @@ All DocuSign variables are optional. If not set, bond-signature endpoints operat
 |----------|----------|-------------|---------------|
 | `SENDGRID_API_KEY` | No | SendGrid API key for compliance report email notifications | `SG.xxxxxxx` |
 | `REPORT_FROM_EMAIL` | No | From address for compliance report notification emails | `reports@tariffshield.io` |
+| `API_PUBLIC_URL` | No (default: `http://localhost:3002`) | Externally reachable API base URL used for download links in scheduled compliance report emails | `https://api.tariffshield.io` |
 
 ---
 
-## Web Service — `apps/web/.env`
+## Web Service — `apps/web/.env.local`
+
+Next.js loads `.env.local` for all environments. Use this file (not `apps/web/.env`) for local web overrides: it takes precedence over a plain `.env` and is what `make setup-env` / `scripts/setup-env.ts` write.
 
 | Variable | Required | Description | Example Value |
 |----------|----------|-------------|---------------|

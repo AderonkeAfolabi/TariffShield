@@ -1,7 +1,9 @@
 'use client';
 
 import { useState } from 'react';
-import { api, ApiError } from '@/lib/api';
+import { api } from '@/lib/api';
+import { formatApiError, type FormattedError } from '@/lib/error-formatter';
+import { DepositWizardTour, useDepositWizardTour } from './DepositWizardTour';
 
 type Step = 'amount' | 'preview' | 'confirm' | 'receipt';
 
@@ -9,17 +11,32 @@ export function DepositWizard({
   importerId,
   bucket,
   onDone,
+  onCancel,
   setError,
 }: {
   importerId: string;
   bucket: 'collateral' | 'reserve';
   onDone: () => Promise<void>;
-  setError: (e: string | null) => void;
+  onCancel?: () => void;
+  setError: (e: FormattedError | string | null) => void;
 }) {
   const [step, setStep] = useState<Step>('amount');
   const [xlm, setXlm] = useState('50');
   const [txHash, setTxHash] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const tour = useDepositWizardTour();
+
+  function resetWizard() {
+    setStep('amount');
+    setXlm('50');
+    setTxHash(null);
+    setBusy(false);
+  }
+
+  function handleCancel() {
+    resetWizard();
+    onCancel?.();
+  }
 
   async function handleDeposit() {
     setBusy(true);
@@ -31,31 +48,61 @@ export function DepositWizard({
       setStep('receipt');
       await onDone();
     } catch (e) {
-      setError(e instanceof ApiError ? e.message : String(e));
+      setError(formatApiError(e));
       setBusy(false);
     }
   }
 
   const bucketLabel = bucket === 'collateral' ? 'Collateral' : 'Reserve (auto-top-up pool)';
 
+  const parsedXlm = Number(xlm);
+  const amountError =
+    !xlm || xlm.trim() === ''
+      ? 'Please enter a deposit amount.'
+      : isNaN(parsedXlm) || parsedXlm <= 0
+        ? 'Amount must be greater than 0 XLM.'
+        : parsedXlm < 0.1
+          ? 'Minimum deposit amount is 0.1 XLM.'
+          : null;
+
   return (
     <div className="space-y-4">
+      <div className="flex items-center justify-end -mb-2">
+        <button
+          type="button"
+          onClick={tour.launch}
+          aria-label="Show guided tour for this form"
+          title="Show guided tour"
+          className="inline-flex items-center justify-center text-muted hover:text-foreground text-xs rounded-full w-4 h-4 border border-muted/40 hover:border-foreground"
+        >
+          ?
+        </button>
+      </div>
+      {tour.active && <DepositWizardTour onClose={tour.close} />}
+
       {step === 'amount' && (
         <>
-          <div className="flex gap-2">
-            <input
-              type="number"
-              step="0.1"
-              min="0.1"
-              value={xlm}
-              onChange={(e) => setXlm(e.target.value)}
-              placeholder="XLM"
-              className="flex-1 rounded-md border border-border bg-background px-2 py-1.5 text-sm focus:border-accent focus:outline-none"
-            />
+          <div>
+            <div className="flex gap-2">
+              <input
+                type="number"
+                step="0.1"
+                min="0.1"
+                value={xlm}
+                onChange={(e) => setXlm(e.target.value)}
+                placeholder="XLM"
+                className="flex-1 rounded-md border border-border bg-background px-2 py-1.5 text-sm focus:border-accent focus:outline-none"
+              />
+            </div>
+            <p className="mt-1 text-xs text-muted">Minimum deposit amount: 0.1 XLM</p>
+            {amountError && <p className="mt-1 text-xs text-danger">{amountError}</p>}
           </div>
           <button
-            onClick={() => setStep('preview')}
-            className="w-full rounded-md bg-accent text-accent-foreground px-3 py-1.5 text-sm hover:opacity-90"
+            onClick={() => {
+              if (!amountError) setStep('preview');
+            }}
+            disabled={Boolean(amountError)}
+            className="w-full rounded-md bg-accent text-accent-foreground px-3 py-1.5 text-sm hover:opacity-90 disabled:opacity-50 disabled:cursor-not-allowed"
           >
             Next
           </button>
@@ -71,10 +118,10 @@ export function DepositWizard({
           </div>
           <div className="flex gap-2">
             <button
-              onClick={() => setStep('amount')}
+              onClick={handleCancel}
               className="flex-1 rounded-md border border-border px-3 py-1.5 text-sm hover:bg-card"
             >
-              Back
+              Cancel
             </button>
             <button
               onClick={() => setStep('confirm')}
@@ -96,12 +143,14 @@ export function DepositWizard({
             </p>
           </div>
           <div className="flex gap-2">
-            <button
-              onClick={() => setStep('preview')}
-              className="flex-1 rounded-md border border-border px-3 py-1.5 text-sm hover:bg-card"
-            >
-              Back
-            </button>
+            {!busy && (
+              <button
+                onClick={handleCancel}
+                className="flex-1 rounded-md border border-border px-3 py-1.5 text-sm hover:bg-card"
+              >
+                Cancel
+              </button>
+            )}
             <button
               onClick={handleDeposit}
               disabled={busy}
@@ -121,8 +170,34 @@ export function DepositWizard({
               {xlm} XLM deposited to {bucketLabel.toLowerCase()}
             </p>
             {txHash && (
-              <p className="mt-2 text-xs font-mono break-all text-accent">{txHash.slice(0, 16)}…</p>
+              <p className="mt-2 text-xs font-mono break-all">
+                <a
+                  href={`https://stellar.expert/explorer/testnet/tx/${txHash}`}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="text-accent hover:underline"
+                >
+                  {txHash.slice(0, 16)}… ↗
+                </a>
+              </p>
             )}
+          </div>
+          {/* #1049 — the receipt is no longer a dead end: the user can start
+              another deposit (state reset to the amount step, clearing the
+              previous txHash) or dismiss the wizard entirely. */}
+          <div className="flex gap-2">
+            <button
+              onClick={resetWizard}
+              className="flex-1 rounded-md bg-accent text-accent-foreground px-3 py-1.5 text-sm hover:opacity-90"
+            >
+              Make another deposit
+            </button>
+            <button
+              onClick={handleCancel}
+              className="flex-1 rounded-md border border-border px-3 py-1.5 text-sm hover:bg-card"
+            >
+              Done
+            </button>
           </div>
         </>
       )}
