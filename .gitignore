@@ -19,6 +19,12 @@ deployments.json
 .vscode
 .idea
 
+# Local DAST scan output (scripts/ingest-dast-findings.ts) — never commit a stray run artifact
+report.json
+
+# Migration run logs written by scripts/migrate-storage.ts (including --dry-run)
+migration-logs/
+
 # Test snapshots
 __snapshots__/
 *.snap
