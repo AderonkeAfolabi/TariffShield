@@ -20,6 +20,7 @@ See [README.md](README.md) for the full walkthrough (Docker Compose, Stellar tes
 # 1. Clone and install
 git clone https://github.com/vjuliaife/TariffShield.git && cd TariffShield
 npm install
+npm run build --workspace=packages/sdk   # scripts importing "@tariffshield/sdk" resolve via dist/ (see docs/sdk-tutorial.md)
 
 # 2. Rust toolchain
 rustup target add wasm32-unknown-unknown
@@ -64,7 +65,9 @@ See [docs/local-dev.md](docs/local-dev.md) for troubleshooting local environment
   ```bash
   cargo fmt --all
   cargo clippy --workspace --all-targets --all-features -- -D warnings
+  cargo deny check licenses bans
   ```
+  `cargo deny` enforces the license allow-list and banned/duplicate crates from [`deny.toml`](deny.toml). Run it whenever you add or bump a Cargo dependency. One-time install: `cargo install cargo-deny --locked`. CI runs the same `cargo deny check licenses bans` in the "Run Cargo Deny Check" step of [`.github/workflows/audit.yml`](.github/workflows/audit.yml). Use plain `cargo deny check` to also include advisories (needs network access to the RustSec DB).
 
 ### Code Formatting & Pre-commit Hooks
 
@@ -72,6 +75,7 @@ Pre-commit hooks are automatically configured via `husky` and `lint-staged` on `
 - `eslint --fix` runs on staged `.ts`/`.tsx` files.
 - `prettier --write` formats staged `.ts`, `.tsx`, `.json`, `.yaml`, and `.md` files.
 - `tsc --noEmit` checks TypeScript types in `apps/api` and `apps/web`.
+- `rustfmt --check` (via `scripts/rustfmt-staged.sh`, using `rustfmt.toml`) runs on staged `.rs` files only and blocks the commit if they aren't formatted; fix with `cargo fmt --all` and re-stage. It is skipped entirely when no Rust files are staged.
 - `commitlint` validates that commit messages follow Conventional Commits format.
 
 ```bash

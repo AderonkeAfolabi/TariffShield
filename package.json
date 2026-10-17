@@ -37,6 +37,9 @@
     "prepare": "husky install || true"
   },
   "lint-staged": {
+    "*.rs": [
+      "sh scripts/rustfmt-staged.sh"
+    ],
     "*.{ts,tsx}": [
       "eslint --fix"
     ],
