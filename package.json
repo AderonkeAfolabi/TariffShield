@@ -25,6 +25,8 @@
     "admin": "tsx scripts/admin.ts",
     "upgrade": "tsx scripts/upgrade.ts",
     "setup-env": "tsx scripts/setup-env.ts",
+    "check:env-example": "tsx scripts/check-env-example-sync.ts",
+    "sync:env-example": "tsx scripts/check-env-example-sync.ts --write",
     "dep-graph": "tsx scripts/dep-graph.ts",
     "backup-state": "tsx scripts/backup-state.ts",
     "verify-upgrade": "tsx scripts/verify-upgrade.ts",
