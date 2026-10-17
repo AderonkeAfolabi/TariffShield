@@ -146,8 +146,9 @@ npm install
 # 3. Local Postgres
 docker compose up -d
 
-# 4. Configure env
-cp .env.example .env
+# 4. Configure env (root .env.example is generated from apps/api/.env.example — the
+#    single source of truth. Edit the API file, then `npm run sync:env-example`.)
+cp .env.example .env                 # read by repo-root scripts (seed, admin, ...)
 cp .env apps/api/.env                # API reads from apps/api/.env
 cp apps/web/.env.example apps/web/.env.local
 
