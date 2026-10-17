@@ -53,7 +53,7 @@ See [docs/local-dev.md](docs/local-dev.md) for troubleshooting local environment
 
 ### Code Style
 
-- **TypeScript** (`apps/api`, `apps/web`, `packages/sdk`): `strict` mode is enabled in every `tsconfig.json` — do not disable it or add `any` to work around a type error. Follow the existing import order (external packages, then internal `@tariffshield/*` / relative imports). Run before pushing:
+- **TypeScript** (`apps/api`, `apps/web`, `packages/sdk`): `strict` mode is enabled in every `tsconfig.json` — do not disable it or add `any` to work around a type error. Follow the existing import order (external packages, then internal `@tariffshield/*` / relative imports). Shared lint rules live in [`packages/eslint-config`](packages/eslint-config/README.md) — extend them with `"extends": ["tariffshield"]` in a workspace's `.eslintrc.json`. Run before pushing:
   ```bash
   npm run typecheck                      # runs typecheck in every workspace that defines it
   npm run lint --workspace=apps/api      # eslint --max-warnings 0
