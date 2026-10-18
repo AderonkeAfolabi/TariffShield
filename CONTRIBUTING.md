@@ -2,15 +2,15 @@
 
 ## Prerequisites
 
-| Tool | Minimum version | Notes |
-|------|------------------|-------|
-| Node.js | 20+ | Pinned via root `package.json` `engines.node` |
-| npm | 10+ | Ships with Node 20 |
-| Rust | stable (2021 edition) | No strict MSRV pinned — see `Cargo.toml` / `contracts/tariff-shield/Cargo.toml` |
-| `wasm32-unknown-unknown` target | — | `rustup target add wasm32-unknown-unknown` |
-| Stellar CLI | latest | https://developers.stellar.org/docs/tools/cli |
-| Docker Desktop | latest | Runs local Postgres via `docker-compose.yml` |
-| PostgreSQL client (`psql`) | any recent | For inspecting the local database directly |
+| Tool                            | Minimum version       | Notes                                                                           |
+| ------------------------------- | --------------------- | ------------------------------------------------------------------------------- |
+| Node.js                         | 20+                   | Pinned via root `package.json` `engines.node`                                   |
+| npm                             | 10+                   | Ships with Node 20                                                              |
+| Rust                            | stable (2021 edition) | No strict MSRV pinned — see `Cargo.toml` / `contracts/tariff-shield/Cargo.toml` |
+| `wasm32-unknown-unknown` target | —                     | `rustup target add wasm32-unknown-unknown`                                      |
+| Stellar CLI                     | latest                | https://developers.stellar.org/docs/tools/cli                                   |
+| Docker Desktop                  | latest                | Runs local Postgres via `docker-compose.yml`                                    |
+| PostgreSQL client (`psql`)      | any recent            | For inspecting the local database directly                                      |
 
 ## Development Setup
 
@@ -49,7 +49,7 @@ curl -f http://localhost:3002/health   # should return 200
 npm run e2e                            # exercises signup → register → deposit → top-up
 ```
 
-See [docs/local-dev.md](docs/local-dev.md) for troubleshooting local environment issues.
+See [docs/local-dev.md](docs/local-dev.md) for troubleshooting local environment issues and the [contributor support channel](docs/local-dev.md#stuck-on-local-setup) if stuck.
 
 ### Code Style
 
@@ -69,10 +69,18 @@ See [docs/local-dev.md](docs/local-dev.md) for troubleshooting local environment
 ### Code Formatting & Pre-commit Hooks
 
 Pre-commit hooks are automatically configured via `husky` and `lint-staged` on `npm install`. Before every commit:
+
 - `eslint --fix` runs on staged `.ts`/`.tsx` files.
 - `prettier --write` formats staged `.ts`, `.tsx`, `.json`, `.yaml`, and `.md` files.
 - `tsc --noEmit` checks TypeScript types in `apps/api` and `apps/web`.
 - `commitlint` validates that commit messages follow Conventional Commits format.
+
+#### Editor Setup & Format-on-Save
+
+To prevent formatting diffs during review, VS Code workspace settings are provided in [`.vscode/settings.json`](.vscode/settings.json). Opening the repository with the recommended extensions ([Prettier](https://marketplace.visualstudio.com/items?itemName=esbenp.prettier-vscode) and [rust-analyzer](https://marketplace.visualstudio.com/items?itemName=rust-lang.rust-analyzer)) enables automatic format-on-save:
+
+- TypeScript, JavaScript, JSON, YAML, and Markdown format automatically on save using root [`.prettierrc`](.prettierrc).
+- Rust (`.rs`) files automatically format on save using `rustfmt` configured by root [`rustfmt.toml`](rustfmt.toml).
 
 ```bash
 # Manual formatting and lint checks
@@ -98,17 +106,21 @@ npm run watch:contracts
 # or
 make watch-contracts
 ```
+
 The watch command uses `-w src/` to watch crate source files only, avoiding build churn in `target/`. Note for Linux users: ensure system `fs.inotify.max_user_watches` is raised if watching fails on large directory structures.
 
 ### Testing
 
-| Suite | Command |
-|-------|---------|
-| Contract unit tests | `cargo test --workspace` (or `npm run contract:test`) |
-| API integration tests | `npm run test:integration --workspace=apps/api` |
-| SDK tests | `npm run test --workspace=packages/sdk` (runs `src/compatibility.test.ts` via `tsx --test`) |
-| Happy-path e2e smoke | `npm run e2e` — start the API first (`npm run dev:api`), then run from the repo root. Exits non-zero on any step failure. |
-| End-to-end tests | `npx playwright test` (from `apps/web`; see `apps/web/package.json` `test:e2e`) |
+| Suite                   | Command                                                                                                                        |
+| ----------------------- | ------------------------------------------------------------------------------------------------------------------------------ |
+| Contract unit tests     | `cargo test --workspace` (or `npm run contract:test`)                                                                          |
+| API integration tests   | `npm run test:integration --workspace=apps/api`                                                                                |
+| SDK tests               | `npm run test --workspace=packages/sdk` (runs `src/compatibility.test.ts` via `tsx --test`)                                    |
+| Happy-path e2e smoke    | `npm run e2e` — start the API first (`npm run dev:api`), then run from the repo root. Exits non-zero on any step failure.      |
+| End-to-end tests        | `npx playwright test` (from `apps/web`; see `apps/web/package.json` `test:e2e`)                                                |
+| Query performance check | Optional regression check for hot-path DB queries via `EXPLAIN ANALYZE` (see [docs/query-analysis.md](docs/query-analysis.md)) |
+
+> **Performance testing**: When modifying database schema, indexes, or high-traffic API endpoints (e.g. `apps/api/src/routes/importers.ts`), refer to [docs/query-analysis.md](docs/query-analysis.md) for instructions on seeding synthetic data and generating reproducible `EXPLAIN (ANALYZE, BUFFERS)` query plans locally.
 
 CI runs the contract, typecheck, and lint suites on every PR — see `.github/workflows/ci.yml` and `.github/workflows/contract.yml`.
 
@@ -130,14 +142,14 @@ All PRs must target the `main` branch. Name your branch by change type, matching
 
 When you open a PR, GitHub will pre-populate the body from [`.github/pull_request_template.md`](.github/pull_request_template.md). Fill in each section:
 
-| Section | Purpose |
-|---------|---------|
-| **Summary** | One paragraph explaining what changed and why. Focus on the motivation, not just what the code does. |
-| **Type of Change** | Tick the appropriate boxes so reviewers understand the scope at a glance. Tick **Breaking change** if existing callers need to update. |
-| **Checklist** | Work through each item before requesting review. If an item does not apply, tick it and add a brief note explaining why. |
-| **Related Issues** | Use `Closes #<number>` to auto-close issues on merge. Multiple issues: `Closes #123, closes #456`. |
-| **Screenshots / Demo** | Required for any PR that changes the Next.js UI. A Loom recording is fine for complex flows. |
-| **Deployment Notes** | List every action required after merge: new env vars, database migrations, contract upgrades, or Render/Vercel manual steps. Leave blank if none. |
+| Section                | Purpose                                                                                                                                           |
+| ---------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Summary**            | One paragraph explaining what changed and why. Focus on the motivation, not just what the code does.                                              |
+| **Type of Change**     | Tick the appropriate boxes so reviewers understand the scope at a glance. Tick **Breaking change** if existing callers need to update.            |
+| **Checklist**          | Work through each item before requesting review. If an item does not apply, tick it and add a brief note explaining why.                          |
+| **Related Issues**     | Use `Closes #<number>` to auto-close issues on merge. Multiple issues: `Closes #123, closes #456`.                                                |
+| **Screenshots / Demo** | Required for any PR that changes the Next.js UI. A Loom recording is fine for complex flows.                                                      |
+| **Deployment Notes**   | List every action required after merge: new env vars, database migrations, contract upgrades, or Render/Vercel manual steps. Leave blank if none. |
 
 ### Review expectations
 
@@ -170,31 +182,31 @@ TariffShield uses [Conventional Commits](https://www.conventionalcommits.org/). 
 
 ### Types
 
-| Type | When to use |
-|------|-------------|
-| `feat` | New feature visible to users or API consumers |
-| `fix` | Bug fix |
-| `docs` | Documentation only |
-| `refactor` | Code change with no behaviour change |
-| `test` | Adding or updating tests |
-| `ci` | Changes to GitHub Actions workflows or CI config |
-| `chore` | Maintenance tasks — dependency bumps, tooling config |
-| `perf` | Performance improvement |
-| `revert` | Reverts a prior commit |
+| Type       | When to use                                          |
+| ---------- | ---------------------------------------------------- |
+| `feat`     | New feature visible to users or API consumers        |
+| `fix`      | Bug fix                                              |
+| `docs`     | Documentation only                                   |
+| `refactor` | Code change with no behaviour change                 |
+| `test`     | Adding or updating tests                             |
+| `ci`       | Changes to GitHub Actions workflows or CI config     |
+| `chore`    | Maintenance tasks — dependency bumps, tooling config |
+| `perf`     | Performance improvement                              |
+| `revert`   | Reverts a prior commit                               |
 
 ### Scopes
 
 Use one of these scopes when the change is specific to a subsystem:
 
-| Scope | Subsystem |
-|-------|-----------|
+| Scope      | Subsystem                                           |
+| ---------- | --------------------------------------------------- |
 | `contract` | Soroban smart contract (`contracts/tariff-shield/`) |
-| `api` | Express API (`apps/api/`) |
-| `web` | Next.js dashboard (`apps/web/`) |
-| `sdk` | TypeScript SDK (`packages/sdk/`) |
-| `ci` | GitHub Actions workflows |
-| `docs` | Documentation in `docs/` |
-| `deps` | Dependency version updates |
+| `api`      | Express API (`apps/api/`)                           |
+| `web`      | Next.js dashboard (`apps/web/`)                     |
+| `sdk`      | TypeScript SDK (`packages/sdk/`)                    |
+| `ci`       | GitHub Actions workflows                            |
+| `docs`     | Documentation in `docs/`                            |
+| `deps`     | Dependency version updates                          |
 
 Omit the scope when the change spans multiple subsystems.
 
@@ -232,11 +244,11 @@ A `BREAKING CHANGE` footer triggers a **major** version bump in the automated re
 
 Releases are automated via [semantic-release](https://semantic-release.gitbook.io/) on every push to `main` (after CI passes). The version bump is determined by the highest-impact commit type since the last release:
 
-| Commit type | Version bump |
-|-------------|-------------|
+| Commit type               | Version bump    |
+| ------------------------- | --------------- |
 | `fix`, `perf`, `refactor` | Patch (`0.1.x`) |
-| `feat` | Minor (`0.x.0`) |
-| `BREAKING CHANGE` footer | Major (`x.0.0`) |
+| `feat`                    | Minor (`0.x.0`) |
+| `BREAKING CHANGE` footer  | Major (`x.0.0`) |
 
 `chore`, `docs`, `ci`, and `test` commits do not trigger a release. `semantic-release` writes the updated version to `package.json` (root and workspaces), appends an entry to [`CHANGELOG.md`](CHANGELOG.md), and creates a GitHub Release with generated release notes.
 

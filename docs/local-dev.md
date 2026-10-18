@@ -5,30 +5,32 @@ This guide covers everything you need to know to run the TariffShield stack loca
 ## Prerequisites
 
 Before you begin, ensure you have the following installed:
+
 - **Node.js 20+**: [Download](https://nodejs.org/)
 - **npm 10+**: Included with Node.js
 - **Docker Desktop**: [Download](https://www.docker.com/products/docker-desktop/)
 - **Rust stable**: [Install via rustup](https://rustup.rs/)
 - **wasm32 target**: Run `rustup target add wasm32-unknown-unknown`
 - **Stellar CLI**: [Installation Guide](https://developers.stellar.org/docs/build/smart-contracts/getting-started/setup)
-- **Recommended Editor**: VS Code with rust-analyzer and ESLint extensions
+- **Recommended Editor**: VS Code with [rust-analyzer](https://marketplace.visualstudio.com/items?itemName=rust-lang.rust-analyzer), [ESLint](https://marketplace.visualstudio.com/items?itemName=dbaeumer.vscode-eslint), and [Prettier](https://marketplace.visualstudio.com/items?itemName=esbenp.prettier-vscode) extensions. The repository includes [`.vscode/settings.json`](../.vscode/settings.json) to enable automatic format-on-save via Prettier for TypeScript/JSON/YAML/Markdown while deferring Rust formatting to rust-analyzer and `rustfmt.toml`.
 
 ## Environment Setup
 
 1. Copy the example environment file for the API:
+
    ```bash
    cp apps/api/.env.example apps/api/.env
    ```
 
 2. Configure your API `.env` variables:
 
-| Variable | Description | Requirement |
-|----------|-------------|-------------|
-| `DATABASE_URL` | PostgreSQL connection string | Required |
-| `PORT` | API server port (default 3002) | Optional |
-| `JWT_SECRET` | Secret for signing tokens | Required |
-| `TARIFF_SHIELD_CONTRACT_ID`| Soroban Contract ID | Required |
-| `STELLAR_NETWORK_PASSPHRASE`| Soroban network passphrase | Required |
+| Variable                     | Description                    | Requirement |
+| ---------------------------- | ------------------------------ | ----------- |
+| `DATABASE_URL`               | PostgreSQL connection string   | Required    |
+| `PORT`                       | API server port (default 3002) | Optional    |
+| `JWT_SECRET`                 | Secret for signing tokens      | Required    |
+| `TARIFF_SHIELD_CONTRACT_ID`  | Soroban Contract ID            | Required    |
+| `STELLAR_NETWORK_PASSPHRASE` | Soroban network passphrase     | Required    |
 
 3. Copy the example environment file for the Web application:
    ```bash
@@ -52,26 +54,35 @@ We use Docker Compose to run a local PostgreSQL instance.
 ## Running the Stack
 
 Install all dependencies from the monorepo root:
+
 ```bash
 npm install
 ```
 
 ### 1. Start the API
+
 In a new terminal window:
+
 ```bash
 npm run dev --workspace=@tariffshield/api
 ```
+
 The API should now be running at `http://localhost:3002`.
 
 ### 2. Start the Web Application
+
 In another terminal window:
+
 ```bash
 npm run dev --workspace=@tariffshield/web
 ```
+
 The dashboard should now be accessible at `http://localhost:3000`.
 
 ### 3. Health Verification
+
 You can check the API health by visiting:
+
 ```bash
 curl http://localhost:3002/health
 ```
@@ -79,6 +90,7 @@ curl http://localhost:3002/health
 ## Smoke Test Workflow
 
 To verify your local environment is fully operational:
+
 1. Navigate to `http://localhost:3000/signup`.
 2. **Signup** for a new account.
 3. **Login** to access the dashboard.
@@ -108,3 +120,12 @@ with `--execute` — once the importer is really registered and funded.
 - **Port Conflicts**: If port 3002 or 5432 is already in use, update the respective `.env` or `docker-compose.yml` configuration.
 - **Missing Environment Variables**: Ensure your `JWT_SECRET` and Stellar-related variables are correctly populated in `.env`.
 - **Docker Startup Failures**: Ensure Docker Desktop is running. Try `docker-compose down` followed by `docker-compose up -d`.
+
+## Stuck on local setup?
+
+If you have followed this guide, [CONTRIBUTING.md](../CONTRIBUTING.md), and [docs/FAQ.md](FAQ.md) and are still blocked by local environment or tooling issues:
+
+1. **Check the FAQ**: Review [docs/FAQ.md](FAQ.md) for quick solutions to the 10 most common setup, database, and dependency errors.
+2. **Search existing issues**: Search [GitHub Issues](https://github.com/vjuliaife/TariffShield/issues) to see if another contributor has already encountered and resolved the problem.
+3. **Open a setup issue**: If unresolved, open an issue on [GitHub Issues](https://github.com/vjuliaife/TariffShield/issues) titled with `[dev-setup]: <brief summary>`, describing your operating system, tool versions (`node -v`, `cargo --version`, `docker --version`), and the exact terminal command and error output.
+4. **Keep production separate**: Note that [docs/runbooks/support-escalation.md](runbooks/support-escalation.md) and [docs/OPERATIONS_RUNBOOK.md](OPERATIONS_RUNBOOK.md) are strictly reserved for production incident response, on-call paging, and surety operational workflows; please do not use production escalation paths for local development questions.
