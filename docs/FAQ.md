@@ -8,18 +8,19 @@
 
 ## Quick Links
 
-| Error keyword                                              | Entry                                                                                                  |
-| ---------------------------------------------------------- | ------------------------------------------------------------------------------------------------------ |
-| `connection refused`, `ECONNREFUSED 5443`                  | [FAQ 1 — Postgres connection refused](#1-postgres-connection-refused-on-startup)                       |
-| `cannot find .env`, `Missing required env`, `invalid_type` | [FAQ 2 — Missing .env file](#2-missing-env-file-crash-on-startup)                                      |
-| `SorobanRpc`, `fetch failed`, `SSL`, `ETIMEDOUT`           | [FAQ 3 — Soroban RPC timeout or SSL error](#3-soroban-rpc-timeout-or-ssl-error)                        |
-| `libpq`, `openssl`, `link error`, `pkg-config`             | [FAQ 4 — cargo build missing libpq or OpenSSL](#4-cargo-build-failing-due-to-missing-libpq-or-openssl) |
-| `XdrDecodingError`, `invalid XDR`, `bad base64`            | [FAQ 5 — XDR decoding panic in the Stellar SDK](#5-xdr-decoding-panic-in-the-stellar-sdk)              |
-| `peer dep`, `ERESOLVE`, `conflicting peer`                 | [FAQ 6 — npm install peer dependency conflicts](#6-npm-install-peer-dependency-conflicts)              |
-| `400`, `Bad Request`, Friendbot                            | [FAQ 7 — Friendbot 400 error on testnet](#7-friendbot-400-error-on-testnet)                            |
-| `NEXT_PUBLIC_`, `undefined` in browser                     | [FAQ 8 — NEXT_PUBLIC_* vars not visible in browser](#8-next_public_-vars-not-visible-in-the-browser)   |
-| `jwt expired`, `TokenExpiredError`, `401`                  | [FAQ 9 — JWT token expired during development](#9-jwt-token-expired-errors-during-development)         |
-| `port 5432`, `address already in use`, `EADDRINUSE`        | [FAQ 10 — docker-compose port conflict on 5432](#10-docker-compose-port-conflict-on-5432)              |
+| Error keyword | Entry |
+|---|---|
+| `connection refused`, `ECONNREFUSED 5443` | [FAQ 1 — Postgres connection refused](#1-postgres-connection-refused-on-startup) |
+| `cannot find .env`, `Missing required env`, `invalid_type` | [FAQ 2 — Missing .env file](#2-missing-env-file-crash-on-startup) |
+| `SorobanRpc`, `fetch failed`, `SSL`, `ETIMEDOUT` | [FAQ 3 — Soroban RPC timeout or SSL error](#3-soroban-rpc-timeout-or-ssl-error) |
+| `libpq`, `openssl`, `link error`, `pkg-config` | [FAQ 4 — cargo build missing libpq or OpenSSL](#4-cargo-build-failing-due-to-missing-libpq-or-openssl) |
+| `XdrDecodingError`, `invalid XDR`, `bad base64` | [FAQ 5 — XDR decoding panic in the Stellar SDK](#5-xdr-decoding-panic-in-the-stellar-sdk) |
+| `peer dep`, `ERESOLVE`, `conflicting peer` | [FAQ 6 — npm install peer dependency conflicts](#6-npm-install-peer-dependency-conflicts) |
+| `400`, `Bad Request`, Friendbot | [FAQ 7 — Friendbot 400 error on testnet](#7-friendbot-400-error-on-testnet) |
+| `NEXT_PUBLIC_`, `undefined` in browser | [FAQ 8 — NEXT_PUBLIC_* vars not visible in browser](#8-next_public_-vars-not-visible-in-the-browser) |
+| `jwt expired`, `TokenExpiredError`, `401` | [FAQ 9 — JWT token expired during development](#9-jwt-token-expired-errors-during-development) |
+| `port 5432`, `address already in use`, `EADDRINUSE` | [FAQ 10 — docker-compose port conflict on 5432](#10-docker-compose-port-conflict-on-5432) |
+| `stellar: command not found`, `wasm32`, `psql`, `6379` | [Local development troubleshooting](#local-development-troubleshooting) |
 
 ---
 
@@ -38,7 +39,7 @@ Error: connect ECONNREFUSED 127.0.0.1:5443
 
 1. Wait for the healthcheck to pass before starting the API:
    ```bash
-   make db          # starts only Postgres and waits for healthy status
+   make db          # starts only Postgres and waits for healthy status (60s timeout)
    make dev         # then start the API
    ```
 2. If running manually, poll until ready:
@@ -360,6 +361,32 @@ brew services stop postgresql@16  # macOS
 #     - "5444:5432"   # or any other free port
 # Then update DATABASE_URL in apps/api/.env accordingly
 ```
+
+---
+
+## Local development troubleshooting
+
+Short fixes for errors you may hit before the API even starts. See also [FAQ 1](#1-postgres-connection-refused-on-startup) and [FAQ 4](#4-cargo-build-failing-due-to-missing-libpq-or-openssl).
+
+### `stellar: command not found`
+
+**Error:** `/bin/sh: stellar: command not found` when running a deploy/upgrade script (`scripts/deploy-contracts.ts` shells out to `stellar contract deploy`). Note that `npm run contract:build` only needs `cargo`.
+**Fix:** install the Stellar CLI (`brew install stellar-cli` or `cargo install --locked stellar-cli`), then confirm with `stellar --version`.
+
+### `can't find crate for core` / wasm32 target not installed
+
+**Error:** `npm run contract:build` fails with `error[E0463]: can't find crate for 'core'` and a note that the `wasm32-unknown-unknown` target may not be installed.
+**Fix:** `rustup target add wasm32-unknown-unknown`, then re-run `npm run contract:build`.
+
+### `psql` can't connect, or connects to the wrong database
+
+**Error:** bare `psql -U tariffshield tariffshield` fails with `connection refused` (nothing on 5432) or `password authentication failed` (a *local* Postgres on 5432 answered instead). The Docker Postgres is published on host port **5443**, not 5432.
+**Fix:** pass the port: `psql -h localhost -p 5443 -U tariffshield -d tariffshield`, or `psql "$DATABASE_URL"`.
+
+### `ECONNREFUSED 127.0.0.1:6379` from BullMQ / cache calls
+
+**Error:** queue workers or cached routes fail with `connect ECONNREFUSED 127.0.0.1:6379`; Redis is not running.
+**Fix:** `docker compose up -d redis` (or `make dev`, which starts Postgres and Redis), and check `REDIS_URL=redis://localhost:6379` in `apps/api/.env`.
 
 ---
 

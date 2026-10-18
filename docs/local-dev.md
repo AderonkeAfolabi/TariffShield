@@ -117,6 +117,8 @@ with `--execute` — once the importer is really registered and funded.
 
 ## Common Issues
 
+For Stellar CLI, wasm32 target, non-default Postgres port (5443), and Redis errors, see [Local development troubleshooting](FAQ.md#local-development-troubleshooting) in the FAQ.
+
 - **Port Conflicts**: If port 3002 or 5432 is already in use, update the respective `.env` or `docker-compose.yml` configuration.
 - **Missing Environment Variables**: Ensure your `JWT_SECRET` and Stellar-related variables are correctly populated in `.env`.
 - **Docker Startup Failures**: Ensure Docker Desktop is running. Try `docker-compose down` followed by `docker-compose up -d`.

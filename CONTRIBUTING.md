@@ -20,6 +20,7 @@ See [README.md](README.md) for the full walkthrough (Docker Compose, Stellar tes
 # 1. Clone and install
 git clone https://github.com/vjuliaife/TariffShield.git && cd TariffShield
 npm install
+npm run build --workspace=packages/sdk   # scripts importing "@tariffshield/sdk" resolve via dist/ (see docs/sdk-tutorial.md)
 
 # 2. Rust toolchain
 rustup target add wasm32-unknown-unknown
@@ -64,7 +65,9 @@ See [docs/local-dev.md](docs/local-dev.md) for troubleshooting local environment
   ```bash
   cargo fmt --all
   cargo clippy --workspace --all-targets --all-features -- -D warnings
+  cargo deny check licenses bans
   ```
+  `cargo deny` enforces the license allow-list and banned/duplicate crates from [`deny.toml`](deny.toml). Run it whenever you add or bump a Cargo dependency. One-time install: `cargo install cargo-deny --locked`. CI runs the same `cargo deny check licenses bans` in the "Run Cargo Deny Check" step of [`.github/workflows/audit.yml`](.github/workflows/audit.yml). Use plain `cargo deny check` to also include advisories (needs network access to the RustSec DB).
 
 ### Code Formatting & Pre-commit Hooks
 
@@ -73,6 +76,7 @@ Pre-commit hooks are automatically configured via `husky` and `lint-staged` on `
 - `eslint --fix` runs on staged `.ts`/`.tsx` files.
 - `prettier --write` formats staged `.ts`, `.tsx`, `.json`, `.yaml`, and `.md` files.
 - `tsc --noEmit` checks TypeScript types in `apps/api` and `apps/web`.
+- `rustfmt --check` (via `scripts/rustfmt-staged.sh`, using `rustfmt.toml`) runs on staged `.rs` files only and blocks the commit if they aren't formatted; fix with `cargo fmt --all` and re-stage. It is skipped entirely when no Rust files are staged.
 - `commitlint` validates that commit messages follow Conventional Commits format.
 
 #### Editor Setup & Format-on-Save
@@ -111,16 +115,26 @@ The watch command uses `-w src/` to watch crate source files only, avoiding buil
 
 ### Testing
 
-| Suite                   | Command                                                                                                                        |
-| ----------------------- | ------------------------------------------------------------------------------------------------------------------------------ |
-| Contract unit tests     | `cargo test --workspace` (or `npm run contract:test`)                                                                          |
-| API integration tests   | `npm run test:integration --workspace=apps/api`                                                                                |
-| SDK tests               | `npm run test --workspace=packages/sdk` (runs `src/compatibility.test.ts` via `tsx --test`)                                    |
-| Happy-path e2e smoke    | `npm run e2e` — start the API first (`npm run dev:api`), then run from the repo root. Exits non-zero on any step failure.      |
-| End-to-end tests        | `npx playwright test` (from `apps/web`; see `apps/web/package.json` `test:e2e`)                                                |
-| Query performance check | Optional regression check for hot-path DB queries via `EXPLAIN ANALYZE` (see [docs/query-analysis.md](docs/query-analysis.md)) |
+| Suite | Command |
+|-------|---------|
+| Contract unit tests | `cargo test --workspace` (or `npm run contract:test`) |
+| API integration tests | `npm run test:integration --workspace=apps/api` |
+| SDK tests | `npm run test --workspace=packages/sdk` (runs `src/compatibility.test.ts` via `tsx --test`) |
+| Happy-path e2e smoke | `npm run e2e` — start the API first (`npm run dev:api`), then run from the repo root. Exits non-zero on any step failure. |
+| End-to-end tests | `npx playwright test` (from `apps/web`; see `apps/web/package.json` `test:e2e`) |
+| Load/benchmark suite | `npm run benchmark` — requires [k6](https://k6.io/docs/get-started/installation/) and a running API; see [Benchmarks](#benchmarks) |
 
-> **Performance testing**: When modifying database schema, indexes, or high-traffic API endpoints (e.g. `apps/api/src/routes/importers.ts`), refer to [docs/query-analysis.md](docs/query-analysis.md) for instructions on seeding synthetic data and generating reproducible `EXPLAIN (ANALYZE, BUFFERS)` query plans locally.
+#### Benchmarks
+
+`npm run benchmark` (root) → `npm run benchmark --workspace=apps/api` → `bash tests/load/run-all.sh`. The script runs the five k6 scripts in `apps/api/tests/load/` one after another (see the [load-test README](apps/api/tests/load/README.md) for endpoints and targets).
+
+- **Tool:** [k6](https://k6.io/docs/get-started/installation/). It is **not** installed by npm — install it separately (e.g. `brew install k6`, or use the `grafana/k6` Docker image). `run-all.sh` calls `k6` directly, so it must be on your `PATH`.
+- **Services:** the API must be running and reachable (`npm run dev:api`), backed by Postgres and Redis (`docker compose up -d postgres redis`). Each script's setup registers a fresh importer, which makes real Stellar testnet calls, so the API needs valid Stellar env vars.
+- **Env vars:** `API_BASE_URL` (default `http://localhost:3002`).
+- **Run time:** about 5–6 minutes — five scripts at 50 virtual users for 1 minute each, plus setup.
+- **Passing:** every script's k6 thresholds hold (e.g. `GET /importers` p95 < 200ms, error rate < 0.1%) and `run-all.sh` exits `0`. **Failing:** any threshold breach prints `!!! <script> exceeded its thresholds !!!` and the run exits `1` after all scripts finish. Per-script JSON summaries are written to `apps/api/tests/load/results/` (gitignored).
+
+For how the results relate to multi-instance deployments, see [docs/scaling.md](docs/scaling.md#verifying-under-load).
 
 CI runs the contract, typecheck, and lint suites on every PR — see `.github/workflows/ci.yml` and `.github/workflows/contract.yml`.
 
